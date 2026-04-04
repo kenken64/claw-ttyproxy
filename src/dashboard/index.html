@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ttyproxy Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --accent-blue: #58a6ff;
+    --accent-green: #3fb950;
+    --accent-red: #f85149;
+    --accent-yellow: #d29922;
+    --accent-purple: #bc8cff;
+    --font-mono: 'Cascadia Code', 'JetBrains Mono', 'Fira Code', monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: var(--font-mono);
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }
+  header h1 {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--accent-blue);
+  }
+  header .status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  header .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--accent-green);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+  .toolbar {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 8px 20px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-shrink: 0;
+    font-size: 12px;
+  }
+  .toolbar button {
+    background: var(--border);
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .toolbar button:hover { background: #30363d88; }
+  .toolbar .count { color: var(--text-dim); }
+  .toolbar input {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    width: 200px;
+  }
+  .toolbar input::placeholder { color: var(--text-dim); }
+
+  .panels {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+  .panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .panel:first-child { border-right: 1px solid var(--border); }
+  .panel-header {
+    background: var(--surface);
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .panel-header .arrow { font-size: 16px; }
+  .panel-header.incoming .arrow { color: var(--accent-blue); }
+  .panel-header.outgoing .arrow { color: var(--accent-green); }
+  .log-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 4px 0;
+  }
+
+  .log-entry {
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    line-height: 1.5;
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  .log-entry:hover { background: #1c2128; }
+  .log-entry.selected { background: #1f2937; border-left: 3px solid var(--accent-blue); }
+  .log-entry .meta {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 2px;
+  }
+  .log-entry .ts { color: var(--text-dim); font-size: 11px; }
+  .log-entry .req-id {
+    background: var(--border);
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    color: var(--accent-purple);
+  }
+  .log-entry .endpoint {
+    color: var(--accent-blue);
+    font-weight: 600;
+  }
+  .log-entry .model-tag {
+    color: var(--accent-yellow);
+    font-size: 11px;
+  }
+  .log-entry .summary { color: var(--text); }
+  .log-entry .stats {
+    color: var(--text-dim);
+    font-size: 11px;
+    margin-top: 2px;
+  }
+  .log-entry.error .summary { color: var(--accent-red); }
+
+  .detail-overlay {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 100;
+    justify-content: center;
+    align-items: center;
+  }
+  .detail-overlay.open { display: flex; }
+  .detail-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    width: 80%;
+    max-width: 900px;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+  }
+  .detail-box .detail-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .detail-box .detail-header h3 { font-size: 14px; }
+  .detail-box .close-btn {
+    background: none; border: none; color: var(--text-dim);
+    font-size: 18px; cursor: pointer;
+  }
+  .detail-box .close-btn:hover { color: var(--text); }
+  .detail-box pre {
+    flex: 1;
+    overflow: auto;
+    padding: 16px;
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: var(--text);
+  }
+
+  .log-list::-webkit-scrollbar { width: 6px; }
+  .log-list::-webkit-scrollbar-track { background: var(--bg); }
+  .log-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ttyproxy dashboard</h1>
+  <div class="status">
+    <div class="dot" id="sseStatus"></div>
+    <span id="sseLabel">Connecting...</span>
+  </div>
+</header>
+
+<div class="toolbar">
+  <input type="text" id="filterInput" placeholder="Filter by request ID, endpoint...">
+  <button onclick="clearLogs()">Clear</button>
+  <button onclick="toggleAutoScroll()">Auto-scroll: <span id="autoScrollLabel">ON</span></button>
+  <span class="count" id="entryCount">0 entries</span>
+</div>
+
+<div class="panels">
+  <div class="panel">
+    <div class="panel-header incoming">
+      <span class="arrow">&rarr;</span>
+      Incoming Requests (OpenClaw &rarr; ttyproxy)
+    </div>
+    <div class="log-list" id="incomingList"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-header outgoing">
+      <span class="arrow">&larr;</span>
+      Outgoing Responses (Claude Code &rarr; OpenClaw)
+    </div>
+    <div class="log-list" id="outgoingList"></div>
+  </div>
+</div>
+
+<div class="detail-overlay" id="detailOverlay" onclick="closeDetail(event)">
+  <div class="detail-box" onclick="event.stopPropagation()">
+    <div class="detail-header">
+      <h3 id="detailTitle">Detail</h3>
+      <button class="close-btn" onclick="closeDetail()">&times;</button>
+    </div>
+    <pre id="detailContent"></pre>
+  </div>
+</div>
+
+<script>
+const incomingList = document.getElementById('incomingList');
+const outgoingList = document.getElementById('outgoingList');
+const filterInput = document.getElementById('filterInput');
+const entryCount = document.getElementById('entryCount');
+const sseStatus = document.getElementById('sseStatus');
+const sseLabel = document.getElementById('sseLabel');
+
+let allEntries = [];
+let autoScroll = true;
+let filter = '';
+
+filterInput.addEventListener('input', e => {
+  filter = e.target.value.toLowerCase();
+  renderAll();
+});
+
+function toggleAutoScroll() {
+  autoScroll = !autoScroll;
+  document.getElementById('autoScrollLabel').textContent = autoScroll ? 'ON' : 'OFF';
+}
+
+function clearLogs() {
+  allEntries = [];
+  renderAll();
+}
+
+function closeDetail(e) {
+  if (e && e.target !== document.getElementById('detailOverlay')) return;
+  document.getElementById('detailOverlay').classList.remove('open');
+}
+
+function showDetail(entry) {
+  const title = `${entry.direction === 'incoming' ? 'REQUEST' : 'RESPONSE'} [${entry.request_id}] ${entry.endpoint}`;
+  document.getElementById('detailTitle').textContent = title;
+
+  let text = `Timestamp: ${entry.timestamp}\n`;
+  text += `Request ID: ${entry.request_id}\n`;
+  text += `Endpoint: ${entry.endpoint}\n`;
+  text += `Model: ${entry.model}\n`;
+  text += `Kind: ${entry.kind}\n`;
+  if (entry.elapsed_ms != null) text += `Elapsed: ${entry.elapsed_ms}ms\n`;
+  if (entry.bytes != null) text += `Bytes: ${entry.bytes}\n`;
+  if (entry.chunks != null) text += `Chunks: ${entry.chunks}\n`;
+  text += `\n--- Detail ---\n${entry.detail || entry.summary}`;
+
+  document.getElementById('detailContent').textContent = text;
+  document.getElementById('detailOverlay').classList.add('open');
+}
+
+function matchesFilter(entry) {
+  if (!filter) return true;
+  const hay = `${entry.request_id} ${entry.endpoint} ${entry.model} ${entry.summary} ${entry.kind}`.toLowerCase();
+  return hay.includes(filter);
+}
+
+function renderEntry(entry) {
+  const div = document.createElement('div');
+  div.className = `log-entry ${entry.kind === 'error' ? 'error' : ''}`;
+  div.onclick = () => showDetail(entry);
+
+  const ts = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : '';
+  let stats = '';
+  if (entry.elapsed_ms != null) stats += `${entry.elapsed_ms}ms`;
+  if (entry.bytes != null) stats += ` | ${formatBytes(entry.bytes)}`;
+  if (entry.chunks != null) stats += ` | ${entry.chunks} chunks`;
+
+  div.innerHTML = `
+    <div class="meta">
+      <span class="ts">${ts}</span>
+      <span class="req-id">${entry.request_id}</span>
+      <span class="endpoint">${entry.endpoint}</span>
+      ${entry.model ? `<span class="model-tag">${entry.model}</span>` : ''}
+    </div>
+    <div class="summary">${escapeHtml(entry.summary)}</div>
+    ${stats ? `<div class="stats">${stats}</div>` : ''}
+  `;
+  return div;
+}
+
+function renderAll() {
+  incomingList.innerHTML = '';
+  outgoingList.innerHTML = '';
+  let count = 0;
+  for (const entry of allEntries) {
+    if (!matchesFilter(entry)) continue;
+    count++;
+    const el = renderEntry(entry);
+    if (entry.direction === 'incoming') {
+      incomingList.appendChild(el);
+    } else {
+      outgoingList.appendChild(el);
+    }
+  }
+  entryCount.textContent = `${count} entries`;
+  if (autoScroll) {
+    incomingList.scrollTop = incomingList.scrollHeight;
+    outgoingList.scrollTop = outgoingList.scrollHeight;
+  }
+}
+
+function appendEntry(entry) {
+  allEntries.push(entry);
+  if (!matchesFilter(entry)) return;
+
+  const el = renderEntry(entry);
+  const list = entry.direction === 'incoming' ? incomingList : outgoingList;
+  list.appendChild(el);
+
+  entryCount.textContent = `${document.querySelectorAll('.log-entry').length} entries`;
+
+  if (autoScroll) {
+    list.scrollTop = list.scrollHeight;
+  }
+}
+
+function formatBytes(b) {
+  if (b < 1024) return b + 'B';
+  if (b < 1048576) return (b / 1024).toFixed(1) + 'KB';
+  return (b / 1048576).toFixed(1) + 'MB';
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// Load existing logs
+fetch('/api/logs')
+  .then(r => r.json())
+  .then(entries => {
+    allEntries = entries;
+    renderAll();
+  })
+  .catch(err => console.error('Failed to load logs:', err));
+
+// SSE for real-time updates
+function connectSSE() {
+  const es = new EventSource('/api/logs/stream');
+  es.onopen = () => {
+    sseStatus.style.background = 'var(--accent-green)';
+    sseLabel.textContent = 'Connected';
+  };
+  es.onmessage = (e) => {
+    try {
+      const entry = JSON.parse(e.data);
+      appendEntry(entry);
+    } catch (err) {
+      console.error('SSE parse error:', err);
+    }
+  };
+  es.onerror = () => {
+    sseStatus.style.background = 'var(--accent-red)';
+    sseLabel.textContent = 'Reconnecting...';
+    es.close();
+    setTimeout(connectSSE, 2000);
+  };
+}
+connectSSE();
+
+// Keyboard shortcut: Escape closes detail
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeDetail();
+});
+</script>
+</body>
+</html>
