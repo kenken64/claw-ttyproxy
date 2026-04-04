@@ -81,7 +81,7 @@ claw-cc-ttyproxy/
 5. log_store.log_incoming_request() -> dashboard SSE broadcast
                 |
 6. ClaudeRunner::run_streaming() or run_blocking()
-   |-- spawns: claude -p --output-format stream-json --dangerously-skip-permissions
+   |-- spawns: claude -p --output-format stream-json --verbose
    |-- writes prompt to stdin, closes stdin
    |-- reads stdout line-by-line, parses JSON events
    |-- sends text chunks through mpsc channel
@@ -104,7 +104,8 @@ claw-cc-ttyproxy/
 - **Live web dashboard** - two-panel view of incoming requests and outgoing responses with real-time SSE updates
 - **Comprehensive logging** - request IDs, headers, full body dumps, timing, chunk counts at configurable verbosity (`RUST_LOG=trace|debug|info`)
 - **33 tests** - 10 unit tests + 23 integration tests using a mock Claude binary
-- **`--dangerously-skip-permissions`** - enabled by default so Claude runs non-interactively
+- **`--verbose`** - automatically added for `stream-json` output format (required by Claude CLI)
+- **`--dangerously-skip-permissions`** - optional; disabled by default and not supported when running as root
 
 ## Supported Endpoints
 
@@ -155,7 +156,7 @@ All configuration is via environment variables:
 | `LISTEN_ADDR` | `127.0.0.1:11435` | API server bind address |
 | `CLAUDE_BIN` | `claude` | Path to Claude Code CLI binary |
 | `MODEL_NAME` | `claude-code:latest` | Model name reported in API responses |
-| `DANGEROUSLY_SKIP_PERMISSIONS` | `true` | Pass `--dangerously-skip-permissions` to Claude |
+| `DANGEROUSLY_SKIP_PERMISSIONS` | `false` | Pass `--dangerously-skip-permissions` to Claude (not supported when running as root) |
 | `TTYPROXY_SHELL` | auto-detect | Shell mode: `cmd`, `powershell`, `bash`, `none` (see below) |
 | `RUST_LOG` | `ttyproxy=debug` | Log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
 
