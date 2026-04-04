@@ -95,6 +95,9 @@ impl ClaudeRunner {
             "--output-format".to_string(),
             output_format.to_string(),
         ];
+        if output_format == "stream-json" {
+            args.push("--verbose".to_string());
+        }
         if self.dangerously_skip_permissions {
             args.push("--dangerously-skip-permissions".to_string());
         }
