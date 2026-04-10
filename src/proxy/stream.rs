@@ -6,6 +6,7 @@ use axum::body::Body;
 use std::convert::Infallible;
 use std::time::Instant;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, interval};
 use tracing::{info, trace};
 
 /// Build a streaming `Body` that emits Ollama chat NDJSON chunks from a channel.
@@ -20,38 +21,71 @@ pub fn chat_stream_body(
         let mut chunk_count: u64 = 0;
         let mut total_bytes: u64 = 0;
         let mut full_text = String::new();
+        // Send empty keepalive chunks every 15s so the client doesn't time out
+        // while claude is busy doing tool calls (which emit no content deltas).
+        let mut keepalive = interval(Duration::from_secs(15));
+        keepalive.tick().await; // consume the immediate first tick
 
-        while let Some(chunk) = rx.recv().await {
-            chunk_count += 1;
-            total_bytes += chunk.len() as u64;
-            full_text.push_str(&chunk);
+        loop {
+            tokio::select! {
+                biased;
+                maybe_chunk = rx.recv() => {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            chunk_count += 1;
+                            total_bytes += chunk.len() as u64;
+                            full_text.push_str(&chunk);
 
-            eprint!("{chunk}");
+                            eprint!("{chunk}");
 
-            trace!(
-                request_id = %request_id,
-                chunk_num = chunk_count,
-                chunk_bytes = chunk.len(),
-                total_bytes_so_far = total_bytes,
-                "emitting chat stream chunk"
-            );
+                            trace!(
+                                request_id = %request_id,
+                                chunk_num = chunk_count,
+                                chunk_bytes = chunk.len(),
+                                total_bytes_so_far = total_bytes,
+                                "emitting chat stream chunk"
+                            );
 
-            let resp = ChatResponse {
-                model: model.clone(),
-                created_at: now_iso(),
-                message: ChatMessage::assistant(chunk),
-                done: false,
-                done_reason: None,
-                total_duration: None,
-                load_duration: None,
-                prompt_eval_count: None,
-                prompt_eval_duration: None,
-                eval_count: None,
-                eval_duration: None,
-            };
-            let mut line = serde_json::to_string(&resp).unwrap();
-            line.push('\n');
-            yield Ok::<_, Infallible>(line);
+                            let resp = ChatResponse {
+                                model: model.clone(),
+                                created_at: now_iso(),
+                                message: ChatMessage::assistant(chunk),
+                                done: false,
+                                done_reason: None,
+                                total_duration: None,
+                                load_duration: None,
+                                prompt_eval_count: None,
+                                prompt_eval_duration: None,
+                                eval_count: None,
+                                eval_duration: None,
+                            };
+                            let mut line = serde_json::to_string(&resp).unwrap();
+                            line.push('\n');
+                            yield Ok::<_, Infallible>(line);
+                        }
+                        None => break, // channel closed, claude subprocess finished
+                    }
+                }
+                _ = keepalive.tick() => {
+                    // Empty chunk to keep the HTTP stream alive during long tool-call phases
+                    let resp = ChatResponse {
+                        model: model.clone(),
+                        created_at: now_iso(),
+                        message: ChatMessage::assistant(String::new()),
+                        done: false,
+                        done_reason: None,
+                        total_duration: None,
+                        load_duration: None,
+                        prompt_eval_count: None,
+                        prompt_eval_duration: None,
+                        eval_count: None,
+                        eval_duration: None,
+                    };
+                    let mut line = serde_json::to_string(&resp).unwrap();
+                    line.push('\n');
+                    yield Ok::<_, Infallible>(line);
+                }
+            }
         }
 
         eprintln!("\n--- [ttyproxy] stream done ---");
@@ -109,39 +143,70 @@ pub fn generate_stream_body(
         let mut chunk_count: u64 = 0;
         let mut total_bytes: u64 = 0;
         let mut full_text = String::new();
+        let mut keepalive = interval(Duration::from_secs(15));
+        keepalive.tick().await;
 
-        while let Some(chunk) = rx.recv().await {
-            chunk_count += 1;
-            total_bytes += chunk.len() as u64;
-            full_text.push_str(&chunk);
+        loop {
+            tokio::select! {
+                biased;
+                maybe_chunk = rx.recv() => {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            chunk_count += 1;
+                            total_bytes += chunk.len() as u64;
+                            full_text.push_str(&chunk);
 
-            eprint!("{chunk}");
+                            eprint!("{chunk}");
 
-            trace!(
-                request_id = %request_id,
-                chunk_num = chunk_count,
-                chunk_bytes = chunk.len(),
-                total_bytes_so_far = total_bytes,
-                "emitting generate stream chunk"
-            );
+                            trace!(
+                                request_id = %request_id,
+                                chunk_num = chunk_count,
+                                chunk_bytes = chunk.len(),
+                                total_bytes_so_far = total_bytes,
+                                "emitting generate stream chunk"
+                            );
 
-            let resp = GenerateResponse {
-                model: model.clone(),
-                created_at: now_iso(),
-                response: chunk,
-                done: false,
-                done_reason: None,
-                context: None,
-                total_duration: None,
-                load_duration: None,
-                prompt_eval_count: None,
-                prompt_eval_duration: None,
-                eval_count: None,
-                eval_duration: None,
-            };
-            let mut line = serde_json::to_string(&resp).unwrap();
-            line.push('\n');
-            yield Ok::<_, Infallible>(line);
+                            let resp = GenerateResponse {
+                                model: model.clone(),
+                                created_at: now_iso(),
+                                response: chunk,
+                                done: false,
+                                done_reason: None,
+                                context: None,
+                                total_duration: None,
+                                load_duration: None,
+                                prompt_eval_count: None,
+                                prompt_eval_duration: None,
+                                eval_count: None,
+                                eval_duration: None,
+                            };
+                            let mut line = serde_json::to_string(&resp).unwrap();
+                            line.push('\n');
+                            yield Ok::<_, Infallible>(line);
+                        }
+                        None => break,
+                    }
+                }
+                _ = keepalive.tick() => {
+                    let resp = GenerateResponse {
+                        model: model.clone(),
+                        created_at: now_iso(),
+                        response: String::new(),
+                        done: false,
+                        done_reason: None,
+                        context: None,
+                        total_duration: None,
+                        load_duration: None,
+                        prompt_eval_count: None,
+                        prompt_eval_duration: None,
+                        eval_count: None,
+                        eval_duration: None,
+                    };
+                    let mut line = serde_json::to_string(&resp).unwrap();
+                    line.push('\n');
+                    yield Ok::<_, Infallible>(line);
+                }
+            }
         }
 
         eprintln!("\n--- [ttyproxy] stream done ---");
