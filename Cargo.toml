@@ -19,9 +19,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-stream = "0.1"
 async-stream = "0.3"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+base64 = "0.22"
 
 [dev-dependencies]
-reqwest = { version = "0.12", features = ["json"] }
 portpicker = "0.1"
 
 [profile.release]

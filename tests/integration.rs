@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use ttyproxy::api::handlers::AppState;
 use ttyproxy::dashboard::log_store::LogStore;
 use ttyproxy::proxy::claude::ClaudeRunner;
+use ttyproxy::proxy::BackendRunner;
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -27,10 +28,10 @@ fn mock_claude_bin() -> PathBuf {
 async fn start_test_server() -> String {
     let log_store = LogStore::new(100);
     let state = AppState {
-        claude: Arc::new(Mutex::new(ClaudeRunner::new(
+        runner: Arc::new(Mutex::new(BackendRunner::Claude(ClaudeRunner::new(
             mock_claude_bin().to_string_lossy().to_string(),
             true, // dangerously_skip_permissions
-        ))),
+        )))),
         model_name: "claude-code:latest".into(),
         log_store,
     };
@@ -518,10 +519,10 @@ async fn test_model_name_passthrough() {
 async fn test_log_store_records_chat() {
     let log_store = LogStore::new(100);
     let state = AppState {
-        claude: Arc::new(Mutex::new(ClaudeRunner::new(
+        runner: Arc::new(Mutex::new(BackendRunner::Claude(ClaudeRunner::new(
             mock_claude_bin().to_string_lossy().to_string(),
             true,
-        ))),
+        )))),
         model_name: "claude-code:latest".into(),
         log_store: log_store.clone(),
     };

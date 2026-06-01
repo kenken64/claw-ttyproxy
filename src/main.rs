@@ -2,7 +2,9 @@ use ttyproxy::api::handlers::AppState;
 use ttyproxy::config::Config;
 use ttyproxy::dashboard;
 use ttyproxy::dashboard::log_store::LogStore;
+use ttyproxy::proxy::bedrock::BedrockRunner;
 use ttyproxy::proxy::claude::ClaudeRunner;
+use ttyproxy::proxy::BackendRunner;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -29,12 +31,31 @@ async fn main() {
 
     let log_store = LogStore::new(500);
 
-    let state = AppState {
-        claude: Arc::new(Mutex::new(ClaudeRunner::new(
-            config.claude_bin,
+    let runner: BackendRunner = if config.use_bedrock() {
+        let token = config.bedrock_bearer_token.clone().unwrap();
+        BackendRunner::Bedrock(BedrockRunner::new(
+            token,
+            config.bedrock_model_id.clone(),
+            config.bedrock_region.clone(),
+            config.bedrock_max_tokens,
+            config.bedrock_timeout_ms,
+        ))
+    } else {
+        BackendRunner::Claude(ClaudeRunner::new(
+            config.claude_bin.clone(),
             config.dangerously_skip_permissions,
-        ))),
-        model_name: config.model_name,
+        ))
+    };
+
+    let backend_label = if config.use_bedrock() {
+        format!("AWS Bedrock ({})", config.bedrock_model_id)
+    } else {
+        format!("Claude CLI ({})", config.claude_bin)
+    };
+
+    let state = AppState {
+        runner: Arc::new(Mutex::new(runner)),
+        model_name: config.model_name.clone(),
         log_store: log_store.clone(),
     };
 
@@ -51,11 +72,15 @@ async fn main() {
     let skip_perms = config.dangerously_skip_permissions;
     eprintln!("========================================");
     eprintln!("  ttyproxy v0.1.0");
-    eprintln!("  Ollama-compatible proxy -> Claude Code");
+    eprintln!("  Ollama-compatible proxy -> {backend_label}");
     eprintln!("  API:       http://{api_addr}");
     eprintln!("  Dashboard: http://{dash_addr}");
     eprintln!("  Logs:      RUST_LOG=trace for max detail");
-    if skip_perms {
+    if config.use_bedrock() {
+        eprintln!("  Region:    {}", config.bedrock_region);
+        eprintln!("  Model:     {}", config.bedrock_model_id);
+        eprintln!("  MaxTokens: {}", config.bedrock_max_tokens);
+    } else if skip_perms {
         eprintln!("  WARNING:   --dangerously-skip-permissions ENABLED");
     }
     eprintln!("========================================");

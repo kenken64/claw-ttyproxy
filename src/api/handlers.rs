@@ -3,7 +3,7 @@
 use crate::api::types::*;
 use crate::dashboard::log_store::LogStore;
 use crate::middleware::logging::next_request_id;
-use crate::proxy::{claude::ClaudeRunner, stream};
+use crate::proxy::{stream, BackendRunner};
 use axum::{
     Json,
     extract::State,
@@ -18,7 +18,7 @@ use tracing::{debug, error, info, warn};
 /// Shared application state passed to handlers.
 #[derive(Clone)]
 pub struct AppState {
-    pub claude: Arc<Mutex<ClaudeRunner>>,
+    pub runner: Arc<Mutex<BackendRunner>>,
     pub model_name: String,
     pub log_store: LogStore,
 }
@@ -141,10 +141,10 @@ pub async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -
         &prompt,
     );
 
-    let runner = state.claude.lock().await;
+    let runner = state.runner.lock().await;
 
     if is_stream {
-        match runner.run_streaming(&prompt, &request_id).await {
+        match runner.run_streaming_chat(&req.messages, &request_id).await {
             Ok(rx) => {
                 info!(request_id = %request_id, "streaming started");
                 let body = stream::chat_stream_body(
@@ -160,13 +160,13 @@ pub async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -
                     .unwrap()
             }
             Err(e) => {
-                error!(request_id = %request_id, error = %e, "claude error (stream)");
+                error!(request_id = %request_id, error = %e, "backend error (stream)");
                 state.log_store.log_error(&request_id, "/api/chat", &e.to_string());
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
         }
     } else {
-        match runner.run_blocking(&prompt, &request_id).await {
+        match runner.run_blocking_chat(&req.messages, &request_id).await {
             Ok(text) => {
                 let elapsed = start.elapsed();
                 info!(
@@ -210,7 +210,7 @@ pub async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -
                 .into_response()
             }
             Err(e) => {
-                error!(request_id = %request_id, error = %e, "claude error (blocking)");
+                error!(request_id = %request_id, error = %e, "backend error (blocking)");
                 state.log_store.log_error(&request_id, "/api/chat", &e.to_string());
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
@@ -268,7 +268,7 @@ pub async fn generate(
         &prompt,
     );
 
-    let runner = state.claude.lock().await;
+    let runner = state.runner.lock().await;
 
     if is_stream {
         match runner.run_streaming(&prompt, &request_id).await {
@@ -287,7 +287,7 @@ pub async fn generate(
                     .unwrap()
             }
             Err(e) => {
-                error!(request_id = %request_id, error = %e, "claude error (stream)");
+                error!(request_id = %request_id, error = %e, "backend error (stream)");
                 state
                     .log_store
                     .log_error(&request_id, "/api/generate", &e.to_string());
@@ -340,7 +340,7 @@ pub async fn generate(
                 .into_response()
             }
             Err(e) => {
-                error!(request_id = %request_id, error = %e, "claude error (blocking)");
+                error!(request_id = %request_id, error = %e, "backend error (blocking)");
                 state
                     .log_store
                     .log_error(&request_id, "/api/generate", &e.to_string());
