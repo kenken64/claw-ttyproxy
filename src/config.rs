@@ -25,6 +25,35 @@ pub struct Config {
     pub bedrock_max_tokens: u32,
     /// Request timeout in milliseconds (`WEB_CHAT_REQUEST_TIMEOUT_MS`).
     pub bedrock_timeout_ms: u64,
+    /// True when any Bedrock-specific env var is set (token / model / max-tokens).
+    /// Used to detect a half-configured Bedrock setup so we can warn loudly
+    /// instead of silently falling back to the Claude CLI backend.
+    pub bedrock_env_present: bool,
+}
+
+/// Normalize a bearer token read from the environment.
+///
+/// Tolerates values that were accidentally pasted as a full shell assignment,
+/// e.g. `export AWS_BEARER_TOKEN_BEDROCK=ABSK…` or `AWS_BEARER_TOKEN_BEDROCK=ABSK…`,
+/// and strips surrounding whitespace and a single layer of matching quotes.
+/// The real token never starts with that prefix, so this only ever repairs a
+/// malformed paste — it cannot corrupt a valid token (trailing `=` padding is
+/// preserved because only a leading prefix is removed).
+fn sanitize_bearer_token(raw: &str) -> String {
+    let mut s = raw.trim();
+    s = s.strip_prefix("export ").map(str::trim_start).unwrap_or(s);
+    s = s
+        .strip_prefix("AWS_BEARER_TOKEN_BEDROCK=")
+        .unwrap_or(s)
+        .trim();
+    // Strip one layer of surrounding quotes, if present.
+    for q in ['"', '\''] {
+        if let Some(inner) = s.strip_prefix(q).and_then(|x| x.strip_suffix(q)) {
+            s = inner;
+            break;
+        }
+    }
+    s.to_string()
 }
 
 impl Config {
@@ -42,6 +71,12 @@ impl Config {
     /// | `BEDROCK_MAX_TOKENS`             | `8192`                                |
     /// | `WEB_CHAT_REQUEST_TIMEOUT_MS`    | `180000`                              |
     pub fn from_env() -> Self {
+        // Detect whether the operator intended to use Bedrock at all, regardless
+        // of whether the token ends up usable.
+        let bedrock_env_present = ["AWS_BEARER_TOKEN_BEDROCK", "BEDROCK_MODEL_ID", "BEDROCK_MAX_TOKENS"]
+            .iter()
+            .any(|k| std::env::var_os(k).is_some());
+
         Self {
             listen_addr: std::env::var("LISTEN_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:11435".into())
@@ -55,6 +90,7 @@ impl Config {
                 .unwrap_or(false),
             bedrock_bearer_token: std::env::var("AWS_BEARER_TOKEN_BEDROCK")
                 .ok()
+                .map(|s| sanitize_bearer_token(&s))
                 .filter(|s| !s.is_empty()),
             bedrock_model_id: std::env::var("BEDROCK_MODEL_ID")
                 .unwrap_or_else(|_| "global.anthropic.claude-sonnet-4-6".into()),
@@ -68,11 +104,61 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(180_000),
+            bedrock_env_present,
         }
     }
 
     /// Returns true when Bedrock env vars are configured.
     pub fn use_bedrock(&self) -> bool {
         self.bedrock_bearer_token.is_some()
+    }
+
+    /// True when the operator clearly intended to use Bedrock (some Bedrock env
+    /// var is set) but no usable bearer token was found — i.e. the proxy is
+    /// about to silently fall back to the Claude CLI backend.
+    pub fn bedrock_misconfigured(&self) -> bool {
+        self.bedrock_env_present && self.bedrock_bearer_token.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_bearer_token;
+
+    #[test]
+    fn keeps_a_plain_token_untouched() {
+        assert_eq!(sanitize_bearer_token("ABSKabc123=="), "ABSKabc123==");
+    }
+
+    #[test]
+    fn strips_export_assignment_prefix() {
+        assert_eq!(
+            sanitize_bearer_token("export AWS_BEARER_TOKEN_BEDROCK=ABSKabc123=="),
+            "ABSKabc123=="
+        );
+    }
+
+    #[test]
+    fn strips_bare_assignment_prefix() {
+        assert_eq!(
+            sanitize_bearer_token("AWS_BEARER_TOKEN_BEDROCK=ABSKabc123=="),
+            "ABSKabc123=="
+        );
+    }
+
+    #[test]
+    fn trims_whitespace_and_quotes() {
+        assert_eq!(sanitize_bearer_token("  ABSKabc==  "), "ABSKabc==");
+        assert_eq!(sanitize_bearer_token("\"ABSKabc==\""), "ABSKabc==");
+        assert_eq!(sanitize_bearer_token("'ABSKabc=='"), "ABSKabc==");
+    }
+
+    #[test]
+    fn preserves_trailing_base64_padding() {
+        // Only a leading prefix is stripped, so trailing `=` padding survives.
+        assert_eq!(
+            sanitize_bearer_token("export AWS_BEARER_TOKEN_BEDROCK=YQ=="),
+            "YQ=="
+        );
     }
 }

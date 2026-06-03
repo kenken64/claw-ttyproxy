@@ -6,13 +6,47 @@ use ttyproxy::proxy::bedrock::BedrockRunner;
 use ttyproxy::proxy::claude::ClaudeRunner;
 use ttyproxy::proxy::BackendRunner;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Locate and load a `.env` file, returning the path that was loaded.
+///
+/// Resolution order (first hit wins). Existing process env vars always take
+/// precedence over file values, so explicit launcher/systemd settings still win.
+///   1. `$TTYPROXY_ENV` — explicit path override.
+///   2. `<dir-of-executable>/.env` — robust for daemons launched with an
+///      unrelated working directory.
+///   3. `.env` discovered from the current directory upward (dotenvy default).
+fn load_dotenv() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("TTYPROXY_ENV") {
+        let path = PathBuf::from(&p);
+        match dotenvy::from_path(&path) {
+            Ok(()) => return Some(path),
+            Err(e) => eprintln!("warning: TTYPROXY_ENV={p} could not be loaded: {e}"),
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(candidate) = exe.parent().map(|d| d.join(".env")) {
+            if candidate.is_file() && dotenvy::from_path(&candidate).is_ok() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    dotenvy::dotenv().ok()
+}
 
 #[tokio::main]
 async fn main() {
+    // Load variables from a `.env` file before reading config, so the selected
+    // backend (Bedrock vs Claude CLI) does not depend on the launcher having
+    // exported them.
+    let dotenv_path = load_dotenv();
+
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("ttyproxy=debug,tower_http=debug"));
 
@@ -28,6 +62,21 @@ async fn main() {
 
     info!("=== ttyproxy v0.1.0 starting ===");
     info!("Log levels: RUST_LOG=trace|debug|info (default: debug)");
+    match dotenv_path {
+        Some(path) => info!(path = %path.display(), "loaded .env file"),
+        None => info!("no .env file found; using process environment only"),
+    }
+
+    // Fail loud, not silent: if the operator set Bedrock vars but we found no
+    // usable token, make the fallback to Claude CLI impossible to miss.
+    if config.bedrock_misconfigured() {
+        warn!("Bedrock env vars are set but AWS_BEARER_TOKEN_BEDROCK is missing/empty; falling back to Claude CLI backend");
+        eprintln!("========================================");
+        eprintln!("  WARNING: Bedrock variables are set, but AWS_BEARER_TOKEN_BEDROCK");
+        eprintln!("           is missing or empty -> FALLING BACK to the Claude CLI backend.");
+        eprintln!("           Set the token (value only, no `export VAR=` prefix) to use Bedrock.");
+        eprintln!("========================================");
+    }
 
     let log_store = LogStore::new(500);
 
