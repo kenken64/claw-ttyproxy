@@ -1,6 +1,8 @@
 # claw-ttyproxy
 
-An Ollama-compatible HTTP proxy that intercepts all Ollama API requests and routes them through **Claude Code CLI** as a subprocess. Any application that speaks the Ollama protocol (e.g. Open WebUI, Continue, etc.) can use Claude Code as its backend without any code changes.
+An Ollama-compatible HTTP proxy that intercepts all Ollama API requests and routes them through one of two backends — **Claude Code CLI** (as a subprocess) or **AWS Bedrock** (over HTTPS with bearer-token auth). Any application that speaks the Ollama protocol (e.g. Open WebUI, Continue, etc.) can use Claude as its backend without any code changes.
+
+The backend is selected automatically: if `AWS_BEARER_TOKEN_BEDROCK` is set the proxy uses Bedrock, otherwise it falls back to the Claude CLI. See [Backends](#backends).
 
 ```
                                   claw-ttyproxy
@@ -39,8 +41,9 @@ claw-cc-ttyproxy/
 |   |   +-- types.rs               # Ollama request/response types + helpers
 |   |   +-- handlers.rs            # Route handlers for all Ollama endpoints
 |   +-- proxy/
-|   |   +-- mod.rs
+|   |   +-- mod.rs                 # BackendRunner enum (Claude CLI | Bedrock) dispatch
 |   |   +-- claude.rs              # Claude Code CLI subprocess runner (TTY passthrough)
+|   |   +-- bedrock.rs             # AWS Bedrock runner (InvokeModel + event-stream parser)
 |   |   +-- stream.rs              # NDJSON streaming body builders
 |   +-- middleware/
 |   |   +-- mod.rs
@@ -61,11 +64,13 @@ claw-cc-ttyproxy/
 | `api::types` | All Ollama-compatible request/response structs, `messages_to_prompt()` converter, helpers |
 | `api::handlers` | Route handlers for `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/embeddings`, stubs for `/api/pull`, `/api/delete`, `/api/copy` |
 | `proxy::claude` | Spawns `claude -p` as a child process. Stdin receives the prompt, stdout is parsed for response chunks. Stderr is inherited for TTY passthrough so Claude's progress UI appears in the host terminal |
-| `proxy::stream` | Converts a `tokio::sync::mpsc::Receiver<String>` of Claude chunks into Ollama-compatible NDJSON `Body` streams |
+| `proxy::bedrock` | Calls the Bedrock `InvokeModel` / `InvokeModelWithResponseStream` APIs over HTTPS with `Authorization: Bearer <token>`; parses the AWS event-stream binary frames into Anthropic SSE text chunks |
+| `proxy` | `BackendRunner` enum that dispatches each request to either the Claude CLI or Bedrock runner, chosen at startup |
+| `proxy::stream` | Converts a `tokio::sync::mpsc::Receiver<String>` of response chunks into Ollama-compatible NDJSON `Body` streams |
 | `middleware::logging` | Axum middleware that logs every HTTP request/response with headers, timing, and unique request IDs |
 | `dashboard::log_store` | Thread-safe bounded ring buffer (default 500 entries) with `tokio::sync::broadcast` for real-time SSE push to connected browsers |
 | `dashboard` | Serves the web UI on a separate port. HTML/CSS/JS is embedded at compile time via `include_str!()` |
-| `config` | Reads all configuration from environment variables with sensible defaults |
+| `config` | Reads all configuration from environment variables (and a `.env` file) with sensible defaults; selects and validates the active backend |
 
 ### Request Flow
 
@@ -99,11 +104,13 @@ claw-cc-ttyproxy/
 ## Features
 
 - **Full Ollama API compatibility** - drop-in replacement for any Ollama client
+- **Two backends** - Claude Code CLI (subprocess) or AWS Bedrock (HTTPS, bearer-token auth), selected automatically from the environment
+- **`.env` support** - loads a `.env` file at startup so backend config doesn't depend on the launcher exporting vars; process env still takes precedence
 - **Streaming & non-streaming** - supports both `stream: true` (NDJSON chunks) and `stream: false` (single JSON response)
 - **TTY passthrough** - Claude Code's stderr goes directly to your terminal so you see its progress UI
 - **Live web dashboard** - two-panel view of incoming requests and outgoing responses with real-time SSE updates
 - **Comprehensive logging** - request IDs, headers, full body dumps, timing, chunk counts at configurable verbosity (`RUST_LOG=trace|debug|info`)
-- **33 tests** - 10 unit tests + 23 integration tests using a mock Claude binary
+- **38 tests** - 15 unit tests + 23 integration tests using a mock Claude binary
 - **`--verbose`** - automatically added for `stream-json` output format (required by Claude CLI)
 - **`--dangerously-skip-permissions`** - optional; disabled by default and not supported when running as root
 
@@ -129,7 +136,8 @@ claw-cc-ttyproxy/
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) 1.70+
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated (`claude` in PATH)
+- For the **Claude CLI backend**: [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated (`claude` in PATH)
+- For the **Bedrock backend**: an `AWS_BEARER_TOKEN_BEDROCK` with access to the configured model/region (no Claude CLI needed)
 
 ### Install & Run
 
@@ -149,16 +157,83 @@ The proxy starts two servers:
 
 ### Configuration
 
-All configuration is via environment variables:
+Configuration is read from environment variables. At startup the proxy also loads a `.env` file (see [Backends](#backends) for the resolution order); existing process env vars always take precedence over `.env` values.
+
+**Common**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LISTEN_ADDR` | `127.0.0.1:11435` | API server bind address |
-| `CLAUDE_BIN` | `claude` | Path to Claude Code CLI binary |
 | `MODEL_NAME` | `claude-code:latest` | Model name reported in API responses |
+| `RUST_LOG` | `ttyproxy=debug` | Log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
+| `TTYPROXY_ENV` | *(unset)* | Explicit path to a `.env` file (overrides auto-discovery) |
+
+**Claude CLI backend** (used when `AWS_BEARER_TOKEN_BEDROCK` is unset)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_BIN` | `claude` | Path to Claude Code CLI binary |
 | `DANGEROUSLY_SKIP_PERMISSIONS` | `false` | Pass `--dangerously-skip-permissions` to Claude (not supported when running as root) |
 | `TTYPROXY_SHELL` | auto-detect | Shell mode: `cmd`, `powershell`, `bash`, `none` (see below) |
-| `RUST_LOG` | `ttyproxy=debug` | Log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
+
+**AWS Bedrock backend** (used when `AWS_BEARER_TOKEN_BEDROCK` is set)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AWS_BEARER_TOKEN_BEDROCK` | *(unset)* | Bedrock API bearer token. **Setting this switches the proxy to the Bedrock backend.** Value only — no `export VAR=` prefix |
+| `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | Bedrock model ID |
+| `AWS_REGION` | `us-east-1` | AWS region for the `bedrock-runtime` endpoint |
+| `BEDROCK_MAX_TOKENS` | `8192` | Max tokens for Bedrock responses |
+| `WEB_CHAT_REQUEST_TIMEOUT_MS` | `180000` | HTTP request timeout (ms) for Bedrock calls |
+
+### Backends
+
+The proxy picks its backend **once at startup**:
+
+- `AWS_BEARER_TOKEN_BEDROCK` **set** → all requests go to **AWS Bedrock** over HTTPS.
+- `AWS_BEARER_TOKEN_BEDROCK` **unset** → requests are handled by the **Claude CLI** subprocess.
+
+The active backend is printed in the startup banner (`Ollama-compatible proxy -> AWS Bedrock (...)` or `-> Claude CLI (...)`). If any Bedrock variable is set but no usable token is found, the proxy logs a prominent warning and falls back to the Claude CLI backend rather than failing silently.
+
+#### `.env` loading
+
+On startup the proxy loads a `.env` file so backend config doesn't depend on the launcher exporting variables. Resolution order (first hit wins; existing process env vars always take precedence over file values):
+
+1. `$TTYPROXY_ENV` — explicit path override
+2. `<directory of the executable>/.env` — robust when launched as a daemon from an unrelated working directory
+3. `.env` discovered from the current directory upward
+
+> **Note:** put the **value only** in `.env` — `AWS_BEARER_TOKEN_BEDROCK=ABSK...`, **not** `export AWS_BEARER_TOKEN_BEDROCK=...`. A stray `export VAR=`/`VAR=` prefix and surrounding quotes/whitespace are stripped automatically, but the raw value is cleanest.
+
+#### Bedrock quickstart
+
+```bash
+cat > .env <<'EOF'
+AWS_BEARER_TOKEN_BEDROCK=ABSK...your-token...
+BEDROCK_MODEL_ID=global.anthropic.claude-sonnet-4-6
+AWS_REGION=ap-southeast-1
+BEDROCK_MAX_TOKENS=64000
+WEB_CHAT_REQUEST_TIMEOUT_MS=180000
+EOF
+
+cargo run --release --bin ttyproxy   # banner should read: -> AWS Bedrock (...)
+```
+
+> The deployed binary must contain the Bedrock feature; builds from before it was added route to the Claude CLI regardless of the environment.
+
+#### Running under systemd
+
+systemd does not inherit your shell environment, so point the unit at the `.env` with `EnvironmentFile=` (it injects the vars straight into the process environment). The leading `-` makes a missing file non-fatal:
+
+```ini
+[Service]
+ExecStart=%h/.local/bin/ttyproxy
+Environment=LISTEN_ADDR=127.0.0.1:11435
+Environment=RUST_LOG=ttyproxy=info
+EnvironmentFile=-%h/path/to/claw-ttyproxy/.env
+```
+
+After editing the unit: `systemctl --user daemon-reload && systemctl --user restart ttyproxy`.
 
 ### Cross-Platform Shell Support
 
@@ -223,9 +298,9 @@ cargo test
 ```
 
 ```
-running 10 tests         # unit tests (types, helpers)
+running 15 tests         # unit tests (types, helpers, config/token sanitizer)
 running 23 tests         # integration tests (all endpoints, streaming, dashboard)
-test result: ok. 33 passed; 0 failed
+test result: ok. 38 passed; 0 failed
 ```
 
 ## Tech Stack
