@@ -250,22 +250,11 @@ impl TokenUsageTracker {
             ],
         )?;
 
-        tx.execute(
-            "update token_quota_state
-             set llm_token_used = llm_token_used + ?1,
-                 remaining_tokens = case
-                     when llm_token_quota is null then null
-                     else llm_token_quota - (llm_token_used + ?1)
-                 end,
-                 received_at = ?2
-             where openclaw_instance = ?3",
-            params![
-                total_tokens,
-                created_at,
-                self.config.openclaw_instance.as_str()
-            ],
-        )?;
-
+        // NOTE: the proxy deliberately does NOT deduct quota locally here.
+        // 2ndBrain.ceo is the single source of truth for quota: we record the
+        // usage event + observed totals and publish the delta to Redis, then
+        // 2ndBrain applies the deduction and pushes the authoritative
+        // `token_quota_state` back via the quota channel (see apply_quota_payload).
         tx.commit()?;
 
         info!(
@@ -760,7 +749,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn records_usage_and_advances_local_quota_state() {
+    async fn records_usage_without_advancing_local_quota_state() {
+        // The proxy must NOT deduct quota locally; 2ndBrain owns the deduction.
+        // Recording usage writes the ledger/totals and publishes the delta, but
+        // leaves token_quota_state untouched until 2ndBrain pushes an update.
         let tracker = TokenUsageTracker::open(test_config(temp_db_path("usage"))).unwrap();
         tracker
             .apply_quota_payload(
@@ -783,11 +775,24 @@ mod tests {
             .await
             .unwrap();
 
+        // Quota state is unchanged by local usage: still the last value 2ndBrain pushed.
         let snapshot = tracker.quota_snapshot().unwrap().unwrap();
         assert_eq!(snapshot.llm_token_quota, Some(100));
-        assert_eq!(snapshot.llm_token_used, 35);
-        assert_eq!(snapshot.remaining_tokens, Some(65));
+        assert_eq!(snapshot.llm_token_used, 10);
+        assert_eq!(snapshot.remaining_tokens, Some(90));
         assert!(tracker.quota_exceeded().unwrap().is_none());
+
+        // But the usage was still recorded locally (ledger + observed totals).
+        let observed: i64 = {
+            let conn = tracker.db.lock().unwrap();
+            conn.query_row(
+                "select total_tokens from token_usage_totals where openclaw_instance = ?1",
+                params!["test-openclaw"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(observed, 25);
     }
 
     #[test]

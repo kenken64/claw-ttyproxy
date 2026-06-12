@@ -1,5 +1,7 @@
 /target
 .env
+.env.keys
+.env.bak-*
 *.pid
 *.sqlite
 *.sqlite3
