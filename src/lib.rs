@@ -3,9 +3,14 @@ pub mod config;
 pub mod dashboard;
 pub mod middleware;
 pub mod proxy;
+pub mod usage;
 
 use api::handlers::{self, AppState};
-use axum::{middleware as axum_mw, routing::{delete, get, post}, Router};
+use axum::{
+    middleware as axum_mw,
+    routing::{delete, get, post},
+    Router,
+};
 use tower_http::cors::CorsLayer;
 
 /// Build the Ollama-compatible API router with the given state.

@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 /// Application configuration, populated from environment variables with sensible defaults.
 pub struct Config {
@@ -29,6 +30,26 @@ pub struct Config {
     /// Used to detect a half-configured Bedrock setup so we can warn loudly
     /// instead of silently falling back to the Claude CLI backend.
     pub bedrock_env_present: bool,
+
+    // -- Token usage tracking -----------------------------------------------
+    /// Enable local SQLite token tracking for Bedrock requests.
+    pub token_usage_tracking: bool,
+    /// SQLite database path for the token usage ledger.
+    pub token_usage_db_path: PathBuf,
+    /// Redis URL used for usage publish and quota subscribe.
+    pub token_usage_redis_url: Option<String>,
+    /// Redis channel where usage events are published for 2ndBrain.
+    pub token_usage_channel: String,
+    /// Redis channel where 2ndBrain publishes quota state for this instance.
+    pub token_quota_channel: String,
+    /// OpenClaw instance identifier used in Redis payloads and quota matching.
+    pub openclaw_instance: String,
+    /// Optional 2ndBrain profile/user id to include in usage payloads.
+    pub openclaw_profile_id: Option<String>,
+    /// Block Bedrock requests when a known quota state is exhausted.
+    pub token_usage_enforce_quota: bool,
+    /// Retry interval for pending Redis usage publish attempts.
+    pub token_usage_flush_interval_ms: u64,
 }
 
 /// Normalize a bearer token read from the environment.
@@ -56,6 +77,30 @@ fn sanitize_bearer_token(raw: &str) -> String {
     s.to_string()
 }
 
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn clean_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn default_openclaw_instance() -> String {
+    clean_env("COMPUTERNAME")
+        .or_else(|| clean_env("HOSTNAME"))
+        .unwrap_or_else(|| "unknown-openclaw-instance".into())
+}
+
 impl Config {
     /// Load configuration from environment variables.
     ///
@@ -73,17 +118,20 @@ impl Config {
     pub fn from_env() -> Self {
         // Detect whether the operator intended to use Bedrock at all, regardless
         // of whether the token ends up usable.
-        let bedrock_env_present = ["AWS_BEARER_TOKEN_BEDROCK", "BEDROCK_MODEL_ID", "BEDROCK_MAX_TOKENS"]
-            .iter()
-            .any(|k| std::env::var_os(k).is_some());
+        let bedrock_env_present = [
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "BEDROCK_MODEL_ID",
+            "BEDROCK_MAX_TOKENS",
+        ]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some());
 
         Self {
             listen_addr: std::env::var("LISTEN_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:11435".into())
                 .parse()
                 .expect("LISTEN_ADDR must be a valid socket address"),
-            model_name: std::env::var("MODEL_NAME")
-                .unwrap_or_else(|_| "claude-code:latest".into()),
+            model_name: std::env::var("MODEL_NAME").unwrap_or_else(|_| "claude-code:latest".into()),
             claude_bin: std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
             dangerously_skip_permissions: std::env::var("DANGEROUSLY_SKIP_PERMISSIONS")
                 .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
@@ -94,8 +142,7 @@ impl Config {
                 .filter(|s| !s.is_empty()),
             bedrock_model_id: std::env::var("BEDROCK_MODEL_ID")
                 .unwrap_or_else(|_| "global.anthropic.claude-sonnet-4-6".into()),
-            bedrock_region: std::env::var("AWS_REGION")
-                .unwrap_or_else(|_| "us-east-1".into()),
+            bedrock_region: std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into()),
             bedrock_max_tokens: std::env::var("BEDROCK_MAX_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -105,6 +152,27 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(180_000),
             bedrock_env_present,
+            token_usage_tracking: env_bool("TOKEN_USAGE_TRACKING", true),
+            token_usage_db_path: std::env::var("TOKEN_USAGE_DB_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("ttyproxy-token-usage.sqlite3")),
+            token_usage_redis_url: clean_env("TOKEN_QUOTA_REDIS_URL")
+                .or_else(|| clean_env("TOKEN_USAGE_REDIS_URL"))
+                .or_else(|| clean_env("REDIS_URL")),
+            token_usage_channel: clean_env("TOKEN_USAGE_REDIS_CHANNEL")
+                .or_else(|| clean_env("TOKEN_USAGE_REDIS_USAGE_CHANNEL"))
+                .unwrap_or_else(|| "openclaw:token_usage:v1".into()),
+            token_quota_channel: clean_env("TOKEN_QUOTA_REDIS_CHANNEL")
+                .or_else(|| clean_env("TOKEN_USAGE_REDIS_QUOTA_CHANNEL"))
+                .unwrap_or_else(|| "2ndbrain:token-quota".into()),
+            openclaw_instance: clean_env("OPENCLAW_INSTANCE")
+                .unwrap_or_else(default_openclaw_instance),
+            openclaw_profile_id: clean_env("OPENCLAW_PROFILE_ID"),
+            token_usage_enforce_quota: env_bool("TOKEN_USAGE_ENFORCE_QUOTA", true),
+            token_usage_flush_interval_ms: std::env::var("TOKEN_USAGE_REDIS_FLUSH_INTERVAL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000),
         }
     }
 

@@ -4,15 +4,16 @@ use crate::api::types::*;
 use crate::dashboard::log_store::LogStore;
 use crate::middleware::logging::next_request_id;
 use crate::proxy::{stream, BackendRunner};
+use crate::usage::{QuotaExceeded, TokenUsageTracker};
 use axum::{
-    Json,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
 /// Shared application state passed to handlers.
@@ -21,6 +22,7 @@ pub struct AppState {
     pub runner: Arc<Mutex<BackendRunner>>,
     pub model_name: String,
     pub log_store: LogStore,
+    pub token_usage_tracker: Option<Arc<TokenUsageTracker>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -88,7 +90,11 @@ pub async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -
     let start = Instant::now();
     let prompt = messages_to_prompt(&req.messages);
     let is_stream = req.stream.unwrap_or(true);
-    let model = req.model.as_deref().unwrap_or(&state.model_name).to_string();
+    let model = req
+        .model
+        .as_deref()
+        .unwrap_or(&state.model_name)
+        .to_string();
     let message_count = req.messages.len();
 
     info!(
@@ -141,6 +147,12 @@ pub async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -
         &prompt,
     );
 
+    if let Some(response) =
+        quota_preflight_chat_response(&state, &request_id, &model, is_stream, start)
+    {
+        return response;
+    }
+
     let runner = state.runner.lock().await;
 
     if is_stream {
@@ -161,7 +173,9 @@ pub async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -
             }
             Err(e) => {
                 error!(request_id = %request_id, error = %e, "backend error (stream)");
-                state.log_store.log_error(&request_id, "/api/chat", &e.to_string());
+                state
+                    .log_store
+                    .log_error(&request_id, "/api/chat", &e.to_string());
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
         }
@@ -211,7 +225,9 @@ pub async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -
             }
             Err(e) => {
                 error!(request_id = %request_id, error = %e, "backend error (blocking)");
-                state.log_store.log_error(&request_id, "/api/chat", &e.to_string());
+                state
+                    .log_store
+                    .log_error(&request_id, "/api/chat", &e.to_string());
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
         }
@@ -222,10 +238,7 @@ pub async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -
 // Generate
 // ---------------------------------------------------------------------------
 
-pub async fn generate(
-    State(state): State<AppState>,
-    Json(req): Json<GenerateRequest>,
-) -> Response {
+pub async fn generate(State(state): State<AppState>, Json(req): Json<GenerateRequest>) -> Response {
     let request_id = next_request_id();
     let start = Instant::now();
 
@@ -234,7 +247,11 @@ pub async fn generate(
         prompt = format!("[System]\n{sys}\n\n{prompt}");
     }
     let is_stream = req.stream.unwrap_or(true);
-    let model = req.model.as_deref().unwrap_or(&state.model_name).to_string();
+    let model = req
+        .model
+        .as_deref()
+        .unwrap_or(&state.model_name)
+        .to_string();
 
     info!(
         request_id = %request_id,
@@ -267,6 +284,12 @@ pub async fn generate(
         &format!("stream={}, prompt={}B", is_stream, prompt.len()),
         &prompt,
     );
+
+    if let Some(response) =
+        quota_preflight_generate_response(&state, &request_id, &model, is_stream, start)
+    {
+        return response;
+    }
 
     let runner = state.runner.lock().await;
 
@@ -383,4 +406,166 @@ pub async fn delete_model() -> StatusCode {
 pub async fn copy_model() -> StatusCode {
     info!("POST /api/copy - stub");
     StatusCode::OK
+}
+
+fn quota_preflight_chat_response(
+    state: &AppState,
+    request_id: &str,
+    model: &str,
+    is_stream: bool,
+    start: Instant,
+) -> Option<Response> {
+    let exceeded = quota_exceeded(state, request_id, "/api/chat")?;
+    let message = quota_exceeded_message(&exceeded);
+
+    if is_stream {
+        let (tx, rx) = mpsc::channel(1);
+        let _ = tx.try_send(message);
+        drop(tx);
+        let body = stream::chat_stream_body(
+            model.to_string(),
+            rx,
+            request_id.to_string(),
+            state.log_store.clone(),
+        );
+        return Some(
+            Response::builder()
+                .header("Content-Type", "application/x-ndjson")
+                .header("Transfer-Encoding", "chunked")
+                .body(body)
+                .unwrap(),
+        );
+    }
+
+    let elapsed = start.elapsed();
+    state.log_store.log_outgoing_response(
+        request_id,
+        "/api/chat",
+        model,
+        &format!("quota exhausted in {:.1}s", elapsed.as_secs_f64()),
+        &message,
+        elapsed.as_millis() as u64,
+        message.len() as u64,
+        None,
+    );
+
+    Some(
+        Json(ChatResponse {
+            model: model.to_string(),
+            created_at: now_iso(),
+            message: ChatMessage::assistant(message),
+            done: true,
+            done_reason: Some("stop".into()),
+            total_duration: Some(elapsed.as_nanos() as u64),
+            load_duration: Some(0),
+            prompt_eval_count: Some(0),
+            prompt_eval_duration: Some(0),
+            eval_count: Some(0),
+            eval_duration: Some(elapsed.as_nanos() as u64),
+        })
+        .into_response(),
+    )
+}
+
+fn quota_preflight_generate_response(
+    state: &AppState,
+    request_id: &str,
+    model: &str,
+    is_stream: bool,
+    start: Instant,
+) -> Option<Response> {
+    let exceeded = quota_exceeded(state, request_id, "/api/generate")?;
+    let message = quota_exceeded_message(&exceeded);
+
+    if is_stream {
+        let (tx, rx) = mpsc::channel(1);
+        let _ = tx.try_send(message);
+        drop(tx);
+        let body = stream::generate_stream_body(
+            model.to_string(),
+            rx,
+            request_id.to_string(),
+            state.log_store.clone(),
+        );
+        return Some(
+            Response::builder()
+                .header("Content-Type", "application/x-ndjson")
+                .header("Transfer-Encoding", "chunked")
+                .body(body)
+                .unwrap(),
+        );
+    }
+
+    let elapsed = start.elapsed();
+    state.log_store.log_outgoing_response(
+        request_id,
+        "/api/generate",
+        model,
+        &format!("quota exhausted in {:.1}s", elapsed.as_secs_f64()),
+        &message,
+        elapsed.as_millis() as u64,
+        message.len() as u64,
+        None,
+    );
+
+    Some(
+        Json(GenerateResponse {
+            model: model.to_string(),
+            created_at: now_iso(),
+            response: message,
+            done: true,
+            done_reason: Some("stop".into()),
+            context: Some(vec![]),
+            total_duration: Some(elapsed.as_nanos() as u64),
+            load_duration: Some(0),
+            prompt_eval_count: Some(0),
+            prompt_eval_duration: Some(0),
+            eval_count: Some(0),
+            eval_duration: Some(elapsed.as_nanos() as u64),
+        })
+        .into_response(),
+    )
+}
+
+fn quota_exceeded(state: &AppState, request_id: &str, endpoint: &str) -> Option<QuotaExceeded> {
+    let tracker = state.token_usage_tracker.as_ref()?;
+    if !tracker.enforces_quota() {
+        return None;
+    }
+
+    match tracker.quota_exceeded() {
+        Ok(Some(exceeded)) => {
+            warn!(
+                request_id = %request_id,
+                endpoint = %endpoint,
+                openclaw_instance = %exceeded.snapshot.openclaw_instance,
+                llm_token_quota = ?exceeded.snapshot.llm_token_quota,
+                llm_token_used = exceeded.snapshot.llm_token_used,
+                remaining_tokens = ?exceeded.snapshot.remaining_tokens,
+                "returning quota exhausted assistant response"
+            );
+            Some(exceeded)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            warn!(
+                request_id = %request_id,
+                endpoint = %endpoint,
+                error = %error,
+                "token quota preflight failed; allowing request"
+            );
+            None
+        }
+    }
+}
+
+fn quota_exceeded_message(exceeded: &QuotaExceeded) -> String {
+    let snapshot = &exceeded.snapshot;
+    match snapshot.llm_token_quota {
+        Some(quota) => format!(
+            "This OpenClaw instance has used all assigned AI credits ({} of {} tokens used). Please top up AI credits in 2ndBrain before sending more requests.",
+            snapshot.llm_token_used, quota
+        ),
+        None => "This OpenClaw instance has used all assigned AI credits. Please top up AI credits in 2ndBrain before sending more requests.".into(),
+    }
 }

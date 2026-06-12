@@ -4,16 +4,19 @@
 //! so no real Claude Code invocation is needed.
 
 use reqwest::Client;
+use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use ttyproxy::api::handlers::AppState;
 use ttyproxy::dashboard::log_store::LogStore;
 use ttyproxy::proxy::claude::ClaudeRunner;
 use ttyproxy::proxy::BackendRunner;
+use ttyproxy::usage::{TokenUsageConfig, TokenUsageTracker};
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -26,6 +29,12 @@ fn mock_claude_bin() -> PathBuf {
 
 /// Spin up the API server on a random free port. Returns the base URL.
 async fn start_test_server() -> String {
+    start_test_server_with_tracker(None).await
+}
+
+async fn start_test_server_with_tracker(
+    token_usage_tracker: Option<Arc<TokenUsageTracker>>,
+) -> String {
     let log_store = LogStore::new(100);
     let state = AppState {
         runner: Arc::new(Mutex::new(BackendRunner::Claude(ClaudeRunner::new(
@@ -34,6 +43,7 @@ async fn start_test_server() -> String {
         )))),
         model_name: "claude-code:latest".into(),
         log_store,
+        token_usage_tracker,
     };
 
     let app = ttyproxy::build_api_router(state);
@@ -56,6 +66,59 @@ async fn start_test_server() -> String {
 
 fn client() -> Client {
     Client::new()
+}
+
+fn temp_db_path(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "ttyproxy-{name}-{}-{nanos}.sqlite3",
+        std::process::id()
+    ))
+}
+
+fn exhausted_quota_tracker() -> Arc<TokenUsageTracker> {
+    let db_path = temp_db_path("quota-exhausted");
+    let tracker = TokenUsageTracker::open(TokenUsageConfig {
+        db_path: db_path.clone(),
+        redis_url: None,
+        usage_channel: "openclaw:token_usage:v1".into(),
+        quota_channel: "2ndbrain:token-quota".into(),
+        openclaw_instance: "test-openclaw".into(),
+        profile_id: Some("profile-1".into()),
+        enforce_quota: true,
+        flush_interval_ms: 1_000,
+    })
+    .unwrap();
+
+    let conn = Connection::open(db_path).unwrap();
+    conn.execute(
+        "insert into token_quota_state (
+            openclaw_instance,
+            profile_id,
+            llm_token_quota,
+            llm_token_used,
+            remaining_tokens,
+            source,
+            received_at,
+            raw_payload
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            "test-openclaw",
+            "profile-1",
+            10_i64,
+            10_i64,
+            0_i64,
+            "test",
+            "2026-06-12T00:00:00Z",
+            "{}"
+        ],
+    )
+    .unwrap();
+
+    tracker
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +556,67 @@ async fn test_chat_with_options() {
 }
 
 #[tokio::test]
+async fn test_chat_quota_exhausted_returns_assistant_message() {
+    let base = start_test_server_with_tracker(Some(exhausted_quota_tracker())).await;
+    let resp = client()
+        .post(format!("{base}/api/chat"))
+        .json(&json!({
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["done"], true);
+    assert_eq!(body["message"]["role"], "assistant");
+    let content = body["message"]["content"].as_str().unwrap();
+    assert!(content.contains("used all assigned AI credits"));
+    assert!(content.contains("2ndBrain"));
+    assert!(!content.contains("Mock response"));
+}
+
+#[tokio::test]
+async fn test_chat_quota_exhausted_streams_assistant_message() {
+    let base = start_test_server_with_tracker(Some(exhausted_quota_tracker())).await;
+    let resp = client()
+        .post(format!("{base}/api/chat"))
+        .json(&json!({
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/x-ndjson"
+    );
+
+    let body = resp.text().await.unwrap();
+    let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+    assert!(lines.len() >= 2);
+
+    let first: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(first["done"], false);
+    assert_eq!(first["message"]["role"], "assistant");
+    assert!(first["message"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("used all assigned AI credits"));
+
+    let last: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(last["done"], true);
+}
+
+#[tokio::test]
 async fn test_model_name_passthrough() {
     // When a custom model name is specified, it should be echoed back
     let base = start_test_server().await;
@@ -525,6 +649,7 @@ async fn test_log_store_records_chat() {
         )))),
         model_name: "claude-code:latest".into(),
         log_store: log_store.clone(),
+        token_usage_tracker: None,
     };
 
     let app = ttyproxy::build_api_router(state);

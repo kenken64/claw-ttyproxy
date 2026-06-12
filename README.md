@@ -186,6 +186,22 @@ Configuration is read from environment variables. At startup the proxy also load
 | `BEDROCK_MAX_TOKENS` | `8192` | Max tokens for Bedrock responses |
 | `WEB_CHAT_REQUEST_TIMEOUT_MS` | `180000` | HTTP request timeout (ms) for Bedrock calls |
 
+**Bedrock token usage / 2ndBrain quota bridge**
+
+Token tracking is active for the Bedrock backend by default. The proxy stores every Bedrock usage event in SQLite, publishes usage deltas to Redis for 2ndBrain.ceo, and listens for Redis quota state updates from 2ndBrain. Quota remains owned by 2ndBrain through its `profiles.llm_token_quota` and `profiles.llm_token_used` fields; the proxy only blocks once it has received a known exhausted quota state.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TOKEN_USAGE_TRACKING` | `true` | Enable SQLite token usage tracking for Bedrock requests |
+| `TOKEN_USAGE_DB_PATH` | `ttyproxy-token-usage.sqlite3` | SQLite ledger path |
+| `TOKEN_QUOTA_REDIS_URL` | `TOKEN_USAGE_REDIS_URL` / `REDIS_URL` fallback | Redis connection URL for publish/subscribe |
+| `TOKEN_QUOTA_REDIS_CHANNEL` | `2ndbrain:token-quota` | Channel where 2ndBrain publishes `token_quota.updated` quota events |
+| `TOKEN_USAGE_REDIS_CHANNEL` | `openclaw:token_usage:v1` | Channel where ttyproxy publishes Bedrock token usage events |
+| `TOKEN_USAGE_ENFORCE_QUOTA` | `true` | Return `402` for Bedrock requests when a known quota state is exhausted |
+| `TOKEN_USAGE_REDIS_FLUSH_INTERVAL_MS` | `10000` | Retry interval for unpublished SQLite events |
+| `OPENCLAW_INSTANCE` | host name | OpenClaw instance id used to match 2ndBrain quota updates |
+| `OPENCLAW_PROFILE_ID` | *(unset)* | Optional 2ndBrain profile/user id used to match quota events that do not include an OpenClaw instance id |
+
 ### Backends
 
 The proxy picks its backend **once at startup**:
@@ -214,12 +230,71 @@ BEDROCK_MODEL_ID=global.anthropic.claude-sonnet-4-6
 AWS_REGION=ap-southeast-1
 BEDROCK_MAX_TOKENS=64000
 WEB_CHAT_REQUEST_TIMEOUT_MS=180000
+TOKEN_QUOTA_REDIS_URL=redis://default:...@host:port
+TOKEN_QUOTA_REDIS_CHANNEL=2ndbrain:token-quota
+OPENCLAW_INSTANCE=your-openclaw-instance-name
+OPENCLAW_PROFILE_ID=supabase-profile-id
 EOF
 
 cargo run --release --bin ttyproxy   # banner should read: -> AWS Bedrock (...)
 ```
 
 > The deployed binary must contain the Bedrock feature; builds from before it was added route to the Claude CLI regardless of the environment.
+
+#### 2ndBrain Redis contract
+
+2ndBrain publishes quota updates to `TOKEN_QUOTA_REDIS_CHANNEL`:
+
+```json
+{
+  "actor": {
+    "email": "admin@example.com",
+    "userId": "admin-user-id"
+  },
+  "availableTokens": 97500,
+  "deltaTokens": 2500,
+  "email": "user@example.com",
+  "event": "token_quota.updated",
+  "llmTokenQuota": 100000,
+  "llmTokenUsed": 2500,
+  "metadata": {},
+  "occurredAt": "2026-06-12T00:00:00.000Z",
+  "reason": "admin_quota_update",
+  "source": "2ndBrain.ceo",
+  "userId": "supabase-profile-id",
+  "version": 1
+}
+```
+
+ttyproxy accepts the direct `openclaw_instance`/`llm_token_quota` shape too. For the 2ndBrain event above, set `OPENCLAW_PROFILE_ID` to the target `userId` so a shared Redis channel cannot apply another user's quota to this OpenClaw instance.
+
+ttyproxy publishes usage deltas to `TOKEN_USAGE_REDIS_CHANNEL` after Bedrock returns usage metadata:
+
+```json
+{
+  "type": "openclaw.token_usage.v1",
+  "event_id": "uuid",
+  "request_id": "req-000001",
+  "provider": "aws_bedrock",
+  "endpoint": "/api/chat",
+  "model": "global.anthropic.claude-sonnet-4-6",
+  "openclaw_instance": "your-openclaw-instance-name",
+  "profile_id": "supabase-profile-id",
+  "input_tokens": 1200,
+  "output_tokens": 340,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 0,
+  "total_tokens": 1540,
+  "llm_token_used_delta": 1540,
+  "observed_llm_token_used": 4040,
+  "llm_token_quota": 100000,
+  "remaining_tokens": 95960,
+  "is_streaming": true,
+  "created_at": "2026-06-12T00:00:00Z"
+}
+```
+
+If Redis is unavailable, the event stays in SQLite with `redis_published_at = null`; the background flusher retries until publish succeeds.
 
 #### Running under systemd
 

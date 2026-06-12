@@ -8,8 +8,10 @@
 //! Anthropic SSE event (same format the Claude CLI emits in stream-json mode).
 
 use crate::api::types::ChatMessage;
+use crate::usage::{TokenUsage, TokenUsageTracker};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use futures::StreamExt;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -20,6 +22,7 @@ pub struct BedrockRunner {
     model_id: String,
     bearer_token: String,
     max_tokens: u32,
+    token_tracker: Option<Arc<TokenUsageTracker>>,
 }
 
 impl BedrockRunner {
@@ -29,6 +32,7 @@ impl BedrockRunner {
         region: String,
         max_tokens: u32,
         timeout_ms: u64,
+        token_tracker: Option<Arc<TokenUsageTracker>>,
     ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(timeout_ms))
@@ -48,6 +52,7 @@ impl BedrockRunner {
             model_id,
             bearer_token,
             max_tokens,
+            token_tracker,
         }
     }
 
@@ -60,7 +65,8 @@ impl BedrockRunner {
         prompt: &str,
         request_id: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        self.invoke(self.body_from_prompt(prompt), request_id).await
+        self.invoke(self.body_from_prompt(prompt), request_id, "/api/generate")
+            .await
     }
 
     pub async fn run_blocking_chat(
@@ -68,7 +74,7 @@ impl BedrockRunner {
         messages: &[ChatMessage],
         request_id: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        self.invoke(self.body_from_messages(messages), request_id)
+        self.invoke(self.body_from_messages(messages), request_id, "/api/chat")
             .await
     }
 
@@ -77,7 +83,7 @@ impl BedrockRunner {
         prompt: &str,
         request_id: &str,
     ) -> Result<mpsc::Receiver<String>, Box<dyn std::error::Error + Send + Sync>> {
-        self.invoke_stream(self.body_from_prompt(prompt), request_id)
+        self.invoke_stream(self.body_from_prompt(prompt), request_id, "/api/generate")
             .await
     }
 
@@ -86,7 +92,7 @@ impl BedrockRunner {
         messages: &[ChatMessage],
         request_id: &str,
     ) -> Result<mpsc::Receiver<String>, Box<dyn std::error::Error + Send + Sync>> {
-        self.invoke_stream(self.body_from_messages(messages), request_id)
+        self.invoke_stream(self.body_from_messages(messages), request_id, "/api/chat")
             .await
     }
 
@@ -136,6 +142,7 @@ impl BedrockRunner {
         &self,
         body: serde_json::Value,
         request_id: &str,
+        endpoint: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{}/model/{}/invoke", self.endpoint_base, self.model_id);
         let start = Instant::now();
@@ -187,6 +194,12 @@ impl BedrockRunner {
             })
             .unwrap_or_default();
 
+        if let Some(usage) = extract_usage(&val) {
+            self.record_usage(usage, endpoint, request_id, false).await;
+        } else {
+            warn!(request_id = %request_id, "bedrock response did not include token usage");
+        }
+
         Ok(text)
     }
 
@@ -194,6 +207,7 @@ impl BedrockRunner {
         &self,
         body: serde_json::Value,
         request_id: &str,
+        endpoint: &str,
     ) -> Result<mpsc::Receiver<String>, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!(
             "{}/model/{}/invoke-with-response-stream",
@@ -220,6 +234,9 @@ impl BedrockRunner {
 
         let (tx, rx) = mpsc::channel::<String>(256);
         let req_id = request_id.to_string();
+        let endpoint = endpoint.to_string();
+        let model_id = self.model_id.clone();
+        let token_tracker = self.token_tracker.clone();
         let start = Instant::now();
 
         tokio::spawn(async move {
@@ -227,6 +244,7 @@ impl BedrockRunner {
             let mut buf: Vec<u8> = Vec::new();
             let mut chunk_count: u64 = 0;
             let mut total_bytes: u64 = 0;
+            let mut usage = BedrockUsage::default();
 
             while let Some(result) = byte_stream.next().await {
                 match result {
@@ -237,21 +255,25 @@ impl BedrockRunner {
                             match parse_event_frame(&buf) {
                                 Some((payload, consumed)) => {
                                     buf.drain(..consumed);
-                                    if let Some(text) =
-                                        extract_text(&payload, &req_id)
-                                    {
-                                        if !text.is_empty() {
-                                            chunk_count += 1;
-                                            total_bytes += text.len() as u64;
-                                            trace!(
-                                                request_id = %req_id,
-                                                chunk = chunk_count,
-                                                bytes = text.len(),
-                                                "bedrock chunk"
-                                            );
-                                            if tx.send(text).await.is_err() {
-                                                warn!(request_id = %req_id, "channel closed");
-                                                return;
+                                    if let Some(event) = extract_stream_event(&payload, &req_id) {
+                                        if let Some(next_usage) = event.usage {
+                                            usage.merge_cumulative(next_usage);
+                                        }
+
+                                        if let Some(text) = event.text {
+                                            if !text.is_empty() {
+                                                chunk_count += 1;
+                                                total_bytes += text.len() as u64;
+                                                trace!(
+                                                    request_id = %req_id,
+                                                    chunk = chunk_count,
+                                                    bytes = text.len(),
+                                                    "bedrock chunk"
+                                                );
+                                                if tx.send(text).await.is_err() {
+                                                    warn!(request_id = %req_id, "channel closed");
+                                                    return;
+                                                }
                                             }
                                         }
                                     }
@@ -274,9 +296,59 @@ impl BedrockRunner {
                 elapsed_ms = start.elapsed().as_millis() as u64,
                 "bedrock stream finished"
             );
+
+            if let Some(tracker) = token_tracker {
+                if usage.total_tokens() > 0 {
+                    let record = TokenUsage {
+                        provider: "aws_bedrock".into(),
+                        endpoint,
+                        request_id: req_id.clone(),
+                        model: model_id,
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                        cache_read_input_tokens: usage.cache_read_input_tokens,
+                        is_streaming: true,
+                    };
+
+                    if let Err(error) = tracker.record_bedrock_usage(record).await {
+                        warn!(request_id = %req_id, error = %error, "failed to record bedrock stream token usage");
+                    }
+                } else {
+                    warn!(request_id = %req_id, "bedrock stream did not include token usage");
+                }
+            }
         });
 
         Ok(rx)
+    }
+
+    async fn record_usage(
+        &self,
+        usage: BedrockUsage,
+        endpoint: &str,
+        request_id: &str,
+        is_streaming: bool,
+    ) {
+        let Some(tracker) = &self.token_tracker else {
+            return;
+        };
+
+        let record = TokenUsage {
+            provider: "aws_bedrock".into(),
+            endpoint: endpoint.into(),
+            request_id: request_id.into(),
+            model: self.model_id.clone(),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            is_streaming,
+        };
+
+        if let Err(error) = tracker.record_bedrock_usage(record).await {
+            warn!(request_id = %request_id, error = %error, "failed to record bedrock token usage");
+        }
     }
 }
 
@@ -315,11 +387,81 @@ fn parse_event_frame(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
     Some((payload, total_len))
 }
 
-/// Decode an event-stream payload and return the text content, if any.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BedrockUsage {
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_creation_input_tokens: i64,
+    cache_read_input_tokens: i64,
+}
+
+impl BedrockUsage {
+    fn total_tokens(&self) -> i64 {
+        self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+    }
+
+    fn merge_cumulative(&mut self, next: Self) {
+        self.input_tokens = self.input_tokens.max(next.input_tokens);
+        self.output_tokens = self.output_tokens.max(next.output_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .max(next.cache_creation_input_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .max(next.cache_read_input_tokens);
+    }
+}
+
+#[derive(Debug, Default)]
+struct BedrockStreamEvent {
+    text: Option<String>,
+    usage: Option<BedrockUsage>,
+}
+
+fn extract_usage(value: &serde_json::Value) -> Option<BedrockUsage> {
+    parse_usage(value.get("usage")?).filter_nonzero()
+}
+
+fn parse_usage(usage: &serde_json::Value) -> Option<BedrockUsage> {
+    let parsed = BedrockUsage {
+        input_tokens: usage_i64(usage, "input_tokens"),
+        output_tokens: usage_i64(usage, "output_tokens"),
+        cache_creation_input_tokens: usage_i64(usage, "cache_creation_input_tokens"),
+        cache_read_input_tokens: usage_i64(usage, "cache_read_input_tokens"),
+    };
+    Some(parsed)
+}
+
+trait NonZeroUsage {
+    fn filter_nonzero(self) -> Option<BedrockUsage>;
+}
+
+impl NonZeroUsage for Option<BedrockUsage> {
+    fn filter_nonzero(self) -> Option<BedrockUsage> {
+        self.filter(|usage| usage.total_tokens() > 0)
+    }
+}
+
+fn usage_i64(usage: &serde_json::Value, key: &str) -> i64 {
+    usage
+        .get(key)
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|v| i64::try_from(v).ok()))
+                .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
+        })
+        .unwrap_or(0)
+}
+
+/// Decode an event-stream payload and return the text content / token usage, if any.
 ///
 /// Normal chunk format:  `{"bytes": "<base64 Anthropic SSE JSON>"}`
 /// Error frame format:   `{"__type": "...", "message": "..."}`
-fn extract_text(payload: &[u8], request_id: &str) -> Option<String> {
+fn extract_stream_event(payload: &[u8], request_id: &str) -> Option<BedrockStreamEvent> {
     if payload.is_empty() {
         return None;
     }
@@ -333,7 +475,10 @@ fn extract_text(payload: &[u8], request_id: &str) -> Option<String> {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown bedrock error");
         error!(request_id = %request_id, error_type = %err_type, %msg, "bedrock error event");
-        return Some(format!("[Bedrock error {err_type}: {msg}]"));
+        return Some(BedrockStreamEvent {
+            text: Some(format!("[Bedrock error {err_type}: {msg}]")),
+            usage: None,
+        });
     }
 
     // Normal chunk: base64-wrapped Anthropic SSE event
@@ -344,12 +489,99 @@ fn extract_text(payload: &[u8], request_id: &str) -> Option<String> {
     let event_type = inner.get("type")?.as_str()?;
     debug!(request_id = %request_id, %event_type, "bedrock inner event");
 
-    match event_type {
+    let text = match event_type {
         "content_block_delta" => inner
             .get("delta")
             .and_then(|d| d.get("text"))
             .and_then(|t| t.as_str())
             .map(|s| s.to_string()),
         _ => None,
+    };
+
+    let usage = match event_type {
+        "message_start" => inner
+            .get("message")
+            .and_then(|message| message.get("usage"))
+            .and_then(parse_usage),
+        "message_delta" => inner.get("usage").and_then(parse_usage),
+        _ => inner.get("usage").and_then(parse_usage),
+    }
+    .filter_nonzero();
+
+    Some(BedrockStreamEvent { text, usage })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encoded_payload(inner: serde_json::Value) -> Vec<u8> {
+        let encoded = B64.encode(serde_json::to_vec(&inner).unwrap());
+        serde_json::to_vec(&serde_json::json!({ "bytes": encoded })).unwrap()
+    }
+
+    #[test]
+    fn extracts_blocking_usage() {
+        let usage = extract_usage(&serde_json::json!({
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 7,
+                "cache_creation_input_tokens": 2,
+                "cache_read_input_tokens": 3
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            usage,
+            BedrockUsage {
+                input_tokens: 10,
+                output_tokens: 7,
+                cache_creation_input_tokens: 2,
+                cache_read_input_tokens: 3,
+            }
+        );
+        assert_eq!(usage.total_tokens(), 22);
+    }
+
+    #[test]
+    fn extracts_streaming_text_and_usage() {
+        let start = extract_stream_event(
+            &encoded_payload(serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "usage": {
+                        "input_tokens": 11,
+                        "output_tokens": 1
+                    }
+                }
+            })),
+            "req-test",
+        )
+        .unwrap();
+
+        assert_eq!(start.usage.unwrap().input_tokens, 11);
+
+        let delta = extract_stream_event(
+            &encoded_payload(serde_json::json!({
+                "type": "content_block_delta",
+                "delta": { "text": "hello" }
+            })),
+            "req-test",
+        )
+        .unwrap();
+
+        assert_eq!(delta.text.as_deref(), Some("hello"));
+
+        let usage = extract_stream_event(
+            &encoded_payload(serde_json::json!({
+                "type": "message_delta",
+                "usage": { "output_tokens": 9 }
+            })),
+            "req-test",
+        )
+        .unwrap();
+
+        assert_eq!(usage.usage.unwrap().output_tokens, 9);
     }
 }
