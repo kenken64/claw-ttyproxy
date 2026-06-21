@@ -121,6 +121,54 @@ fn exhausted_quota_tracker() -> Arc<TokenUsageTracker> {
     tracker
 }
 
+fn paused_quota_tracker() -> Arc<TokenUsageTracker> {
+    let db_path = temp_db_path("quota-paused");
+    let tracker = TokenUsageTracker::open(TokenUsageConfig {
+        db_path: db_path.clone(),
+        redis_url: None,
+        usage_channel: "openclaw:token_usage:v1".into(),
+        quota_channel: "2ndbrain:token-quota".into(),
+        openclaw_instance: "test-openclaw".into(),
+        profile_id: Some("profile-1".into()),
+        enforce_quota: true,
+        flush_interval_ms: 1_000,
+    })
+    .unwrap();
+
+    let conn = Connection::open(db_path).unwrap();
+    conn.execute(
+        "insert into token_quota_state (
+            openclaw_instance,
+            profile_id,
+            llm_token_quota,
+            llm_token_used,
+            remaining_tokens,
+            openclaw_tokens_paused,
+            openclaw_tokens_paused_at,
+            openclaw_tokens_pause_reason,
+            source,
+            received_at,
+            raw_payload
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            "test-openclaw",
+            "profile-1",
+            100_i64,
+            25_i64,
+            75_i64,
+            1_i64,
+            "2026-06-21T10:00:00Z",
+            "user_pause",
+            "test",
+            "2026-06-21T10:00:00Z",
+            "{}"
+        ],
+    )
+    .unwrap();
+
+    tracker
+}
+
 // ---------------------------------------------------------------------------
 // Health / metadata tests
 // ---------------------------------------------------------------------------
@@ -614,6 +662,29 @@ async fn test_chat_quota_exhausted_streams_assistant_message() {
 
     let last: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
     assert_eq!(last["done"], true);
+}
+
+#[tokio::test]
+async fn test_chat_paused_returns_assistant_message() {
+    let base = start_test_server_with_tracker(Some(paused_quota_tracker())).await;
+    let resp = client()
+        .post(format!("{base}/api/chat"))
+        .json(&json!({
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["done"], true);
+    assert_eq!(body["message"]["role"], "assistant");
+    let content = body["message"]["content"].as_str().unwrap();
+    assert!(content.contains("OpenClaw AI usage is paused"));
+    assert!(content.contains("2ndBrain"));
+    assert!(!content.contains("Mock response"));
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@ use crate::api::types::*;
 use crate::dashboard::log_store::LogStore;
 use crate::middleware::logging::next_request_id;
 use crate::proxy::{stream, BackendRunner};
-use crate::usage::{QuotaExceeded, TokenUsageTracker};
+use crate::usage::{QuotaBlockReason, QuotaExceeded, TokenUsageTracker};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -542,7 +542,9 @@ fn quota_exceeded(state: &AppState, request_id: &str, endpoint: &str) -> Option<
                 llm_token_quota = ?exceeded.snapshot.llm_token_quota,
                 llm_token_used = exceeded.snapshot.llm_token_used,
                 remaining_tokens = ?exceeded.snapshot.remaining_tokens,
-                "returning quota exhausted assistant response"
+                openclaw_tokens_paused = exceeded.snapshot.openclaw_tokens_paused,
+                block_reason = ?exceeded.reason,
+                "returning quota blocked assistant response"
             );
             Some(exceeded)
         }
@@ -561,11 +563,14 @@ fn quota_exceeded(state: &AppState, request_id: &str, endpoint: &str) -> Option<
 
 fn quota_exceeded_message(exceeded: &QuotaExceeded) -> String {
     let snapshot = &exceeded.snapshot;
-    match snapshot.llm_token_quota {
-        Some(quota) => format!(
-            "This OpenClaw instance has used all assigned AI credits ({} of {} tokens used). Please top up AI credits in 2ndBrain before sending more requests.",
-            snapshot.llm_token_used, quota
-        ),
-        None => "This OpenClaw instance has used all assigned AI credits. Please top up AI credits in 2ndBrain before sending more requests.".into(),
+    match exceeded.reason {
+        QuotaBlockReason::Paused => "OpenClaw AI usage is paused in 2ndBrain. Resume AI usage in Settings before sending more requests.".into(),
+        QuotaBlockReason::Exhausted => match snapshot.llm_token_quota {
+            Some(quota) => format!(
+                "This OpenClaw instance has used all assigned AI credits ({} of {} tokens used). Please top up AI credits in 2ndBrain before sending more requests.",
+                snapshot.llm_token_used, quota
+            ),
+            None => "This OpenClaw instance has used all assigned AI credits. Please top up AI credits in 2ndBrain before sending more requests.".into(),
+        },
     }
 }

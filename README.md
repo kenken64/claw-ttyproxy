@@ -188,7 +188,7 @@ Configuration is read from environment variables. At startup the proxy also load
 
 **Bedrock token usage / 2ndBrain quota bridge**
 
-Token tracking is active for the Bedrock backend by default. The proxy stores every Bedrock usage event in SQLite, publishes usage deltas to Redis for 2ndBrain.ceo, and listens for Redis quota state updates from 2ndBrain. Quota remains owned by 2ndBrain through its `profiles.llm_token_quota` and `profiles.llm_token_used` fields; the proxy only blocks once it has received a known exhausted quota state.
+Token tracking is active for the Bedrock backend by default. The proxy stores every Bedrock usage event in SQLite, publishes usage deltas to Redis for 2ndBrain.ceo, and listens for Redis quota state updates from 2ndBrain. Quota remains owned by 2ndBrain through its `profiles.llm_token_quota` and `profiles.llm_token_used` fields; the proxy blocks once it has received a known exhausted quota state or a pause state.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -257,6 +257,7 @@ cargo run --release --bin ttyproxy   # banner should read: -> AWS Bedrock (...)
   "event": "token_quota.updated",
   "llmTokenQuota": 100000,
   "llmTokenUsed": 2500,
+  "openclawTokensPaused": false,
   "metadata": {},
   "occurredAt": "2026-06-12T00:00:00.000Z",
   "reason": "admin_quota_update",
@@ -267,6 +268,22 @@ cargo run --release --bin ttyproxy   # banner should read: -> AWS Bedrock (...)
 ```
 
 ttyproxy accepts the direct `openclaw_instance`/`llm_token_quota` shape too. For the 2ndBrain event above, set `OPENCLAW_PROFILE_ID` to the target `userId` so a shared Redis channel cannot apply another user's quota to this OpenClaw instance.
+
+2ndBrain can pause OpenClaw AI usage without changing credits by publishing:
+
+```json
+{
+  "event": "token_quota.updated",
+  "openclaw_instance": "your-openclaw-instance-name",
+  "openclawTokensPaused": true,
+  "openclawTokensPausedAt": "2026-06-21T10:00:00Z",
+  "openclawTokensPauseReason": "user_pause",
+  "reason": "openclaw_tokens_paused",
+  "source": "2ndBrain.ceo"
+}
+```
+
+Resume with `"openclawTokensPaused": false`. Pause/resume events preserve the existing quota snapshot when quota fields are omitted, so unpausing does not reset `llmTokenQuota`, `llmTokenUsed`, or remaining credits.
 
 ttyproxy publishes usage deltas to `TOKEN_USAGE_REDIS_CHANNEL` after Bedrock returns usage metadata:
 

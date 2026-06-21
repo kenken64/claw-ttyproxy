@@ -78,6 +78,7 @@ fresh from SQLite, no restart needed).
   "llmTokenQuota": 1000000,
   "llmTokenUsed": 734512,
   "remainingTokens": 265488,
+  "openclawTokensPaused": false,
   "source": "2ndBrain.ceo",
   "reason": "quota_sync",
   "occurredAt": "2026-06-12T11:00:00.000Z",
@@ -85,8 +86,9 @@ fresh from SQLite, no restart needed).
 }
 ```
 
-**Enforcement rule:** Bedrock is blocked when `remainingTokens <= 0`, allowed
-when `> 0`. Keep `remainingTokens = llmTokenQuota − llmTokenUsed`.
+**Enforcement rule:** Bedrock is blocked when `openclawTokensPaused = true`
+or when `remainingTokens <= 0`. It is allowed when not paused and
+`remainingTokens > 0`. Keep `remainingTokens = llmTokenQuota − llmTokenUsed`.
 
 ### Disable an instance
 
@@ -116,6 +118,39 @@ when `> 0`. Keep `remainingTokens = llmTokenQuota − llmTokenUsed`.
 }
 ```
 
+### Pause AI usage without changing credits
+
+```json
+{
+  "event": "token_quota.updated",
+  "openclaw_instance": "openclaw-bcd56ecb",
+  "llmTokenQuota": 1000000,
+  "llmTokenUsed": 734512,
+  "remainingTokens": 265488,
+  "openclawTokensPaused": true,
+  "openclawTokensPausedAt": "2026-06-21T10:00:00.000Z",
+  "openclawTokensPauseReason": "user_pause",
+  "source": "2ndBrain.ceo",
+  "reason": "openclaw_tokens_paused"
+}
+```
+
+### Resume AI usage without changing credits
+
+```json
+{
+  "event": "token_quota.updated",
+  "openclaw_instance": "openclaw-bcd56ecb",
+  "openclawTokensPaused": false,
+  "source": "2ndBrain.ceo",
+  "reason": "openclaw_tokens_resumed"
+}
+```
+
+Pause and resume events must not reset `llmTokenQuota`, `llmTokenUsed`, or
+`remainingTokens`. If those fields are omitted, ttyproxy preserves the last
+known quota snapshot and only updates the pause state.
+
 ### Field reference
 
 | Field | Required | Accepted aliases | Notes |
@@ -125,14 +160,17 @@ when `> 0`. Keep `remainingTokens = llmTokenQuota − llmTokenUsed`.
 | `llmTokenQuota` | one of these 3 | `llm_token_quota`, `quota` | total allotment |
 | `llmTokenUsed` | one of these 3 | `llm_token_used`, `used` | consumed |
 | `remainingTokens` | one of these 3 | `remaining_tokens`, `availableTokens`, `available_tokens`, `remaining` | the gate value |
+| `openclawTokensPaused` | optional | `openclaw_tokens_paused`, `tokensPaused`, `tokens_paused`, `paused`, nested in `metadata` | when true, blocks new model calls even with credits remaining |
+| `openclawTokensPausedAt` | optional | `openclaw_tokens_paused_at`, `tokensPausedAt`, `tokens_paused_at`, `pausedAt`, nested in `metadata` | audit/display timestamp from 2ndBrain |
+| `openclawTokensPauseReason` | optional | `openclaw_tokens_pause_reason`, `tokensPauseReason`, `tokens_pause_reason`, `pauseReason`, nested in `metadata` | free-text reason such as `user_pause` |
 | `profile_id` | optional | `profileId`, `user_id`, `userId`, `userID`, nested in `metadata` | used for matching only if instance is absent |
 | `source` | optional | — | free text |
 | other (`actor`, `deltaTokens`, `email`, `metadata`, `version`, …) | optional | — | ignored — keep your standard envelope |
 
 ### Semantics
 
-- At least one of quota / used / remaining must be present, else the event is
-  rejected (`"quota update must include quota, used, or remaining tokens"`).
+- At least one of quota / used / remaining / paused state must be present, else
+  the event is rejected.
 - **Precedence:** if `quota` is present, ttyproxy computes
   `remaining = quota − used`; the `remaining` field is only a fallback used when
   no quota is known. Always send the consistent triple for deterministic results.
@@ -146,7 +184,7 @@ when `> 0`. Keep `remainingTokens = llmTokenQuota − llmTokenUsed`.
 
 ### UX note
 
-While `remainingTokens <= 0`, ttyproxy returns a normal `200` with the assistant
-message *"This OpenClaw instance has used all assigned AI credits … top up in
-2ndBrain"* and does not call Bedrock (no tokens spent). It is **not** an HTTP
-error. A distinct "disabled by admin" status would require a code change.
+While `openclawTokensPaused = true`, ttyproxy returns a normal `200` with the
+assistant message *"OpenClaw AI usage is paused in 2ndBrain …"* and does not call
+Bedrock. While `remainingTokens <= 0`, it returns the existing top-up message.
+Neither blocked state spends tokens.

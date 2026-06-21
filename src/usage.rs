@@ -58,11 +58,21 @@ pub struct QuotaSnapshot {
     pub llm_token_quota: Option<i64>,
     pub llm_token_used: i64,
     pub remaining_tokens: Option<i64>,
+    pub openclaw_tokens_paused: bool,
+    pub openclaw_tokens_paused_at: Option<String>,
+    pub openclaw_tokens_pause_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuotaBlockReason {
+    Exhausted,
+    Paused,
 }
 
 #[derive(Debug, Clone)]
 pub struct QuotaExceeded {
     pub snapshot: QuotaSnapshot,
+    pub reason: QuotaBlockReason,
 }
 
 pub struct TokenUsageTracker {
@@ -137,8 +147,18 @@ impl TokenUsageTracker {
             return Ok(None);
         };
 
+        if snapshot.openclaw_tokens_paused {
+            return Ok(Some(QuotaExceeded {
+                snapshot,
+                reason: QuotaBlockReason::Paused,
+            }));
+        }
+
         if matches!(snapshot.remaining_tokens, Some(remaining) if remaining <= 0) {
-            return Ok(Some(QuotaExceeded { snapshot }));
+            return Ok(Some(QuotaExceeded {
+                snapshot,
+                reason: QuotaBlockReason::Exhausted,
+            }));
         }
 
         Ok(None)
@@ -420,6 +440,10 @@ impl TokenUsageTracker {
             );
             object.insert("remaining_tokens".into(), json!(quota.remaining_tokens));
             object.insert("llm_token_quota".into(), json!(quota.llm_token_quota));
+            object.insert(
+                "openclaw_tokens_paused".into(),
+                json!(quota.openclaw_tokens_paused),
+            );
         }
 
         Ok(payload)
@@ -530,9 +554,78 @@ impl TokenUsageTracker {
                 "remaining",
             ],
         );
+        let paused = bool_field(
+            &value,
+            &[
+                "openclaw_tokens_paused",
+                "openclawTokensPaused",
+                "tokens_paused",
+                "tokensPaused",
+                "paused",
+            ],
+        )
+        .or_else(|| {
+            nested_bool_field(
+                &value,
+                "metadata",
+                &[
+                    "openclaw_tokens_paused",
+                    "openclawTokensPaused",
+                    "tokens_paused",
+                    "tokensPaused",
+                    "paused",
+                ],
+            )
+        });
+        let paused_at = string_field(
+            &value,
+            &[
+                "openclaw_tokens_paused_at",
+                "openclawTokensPausedAt",
+                "tokens_paused_at",
+                "tokensPausedAt",
+                "pausedAt",
+            ],
+        )
+        .or_else(|| {
+            nested_string_field(
+                &value,
+                "metadata",
+                &[
+                    "openclaw_tokens_paused_at",
+                    "openclawTokensPausedAt",
+                    "tokens_paused_at",
+                    "tokensPausedAt",
+                    "pausedAt",
+                ],
+            )
+        });
+        let pause_reason = string_field(
+            &value,
+            &[
+                "openclaw_tokens_pause_reason",
+                "openclawTokensPauseReason",
+                "tokens_pause_reason",
+                "tokensPauseReason",
+                "pauseReason",
+            ],
+        )
+        .or_else(|| {
+            nested_string_field(
+                &value,
+                "metadata",
+                &[
+                    "openclaw_tokens_pause_reason",
+                    "openclawTokensPauseReason",
+                    "tokens_pause_reason",
+                    "tokensPauseReason",
+                    "pauseReason",
+                ],
+            )
+        });
 
-        if quota.is_none() && used.is_none() && remaining.is_none() {
-            return Err("quota update must include quota, used, or remaining tokens".into());
+        if quota.is_none() && used.is_none() && remaining.is_none() && paused.is_none() {
+            return Err("quota update must include quota, used, remaining, or paused state".into());
         }
 
         let existing = self.quota_snapshot_for_instance(&incoming_instance)?;
@@ -545,6 +638,31 @@ impl TokenUsageTracker {
             .unwrap_or(0);
         let next_remaining = next_quota.map(|quota| quota - next_used).or(remaining);
         let received_at = chrono::Utc::now().to_rfc3339();
+        let next_paused = paused
+            .or_else(|| existing.as_ref().map(|s| s.openclaw_tokens_paused))
+            .unwrap_or(false);
+        let next_paused_at = if next_paused {
+            paused_at
+                .or_else(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|s| s.openclaw_tokens_paused_at.clone())
+                })
+                .or_else(|| Some(received_at.clone()))
+        } else {
+            None
+        };
+        let next_pause_reason = if next_paused {
+            pause_reason
+                .or_else(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|s| s.openclaw_tokens_pause_reason.clone())
+                })
+                .or_else(|| Some("openclaw_tokens_paused".into()))
+        } else {
+            None
+        };
         let source = string_field(&value, &["source"]).unwrap_or_else(|| "redis".into());
 
         let conn = self.db.lock().expect("token usage database mutex poisoned");
@@ -555,15 +673,21 @@ impl TokenUsageTracker {
                 llm_token_quota,
                 llm_token_used,
                 remaining_tokens,
+                openclaw_tokens_paused,
+                openclaw_tokens_paused_at,
+                openclaw_tokens_pause_reason,
                 source,
                 received_at,
                 raw_payload
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             on conflict(openclaw_instance) do update set
                 profile_id = coalesce(excluded.profile_id, token_quota_state.profile_id),
                 llm_token_quota = excluded.llm_token_quota,
                 llm_token_used = excluded.llm_token_used,
                 remaining_tokens = excluded.remaining_tokens,
+                openclaw_tokens_paused = excluded.openclaw_tokens_paused,
+                openclaw_tokens_paused_at = excluded.openclaw_tokens_paused_at,
+                openclaw_tokens_pause_reason = excluded.openclaw_tokens_pause_reason,
                 source = excluded.source,
                 received_at = excluded.received_at,
                 raw_payload = excluded.raw_payload",
@@ -573,6 +697,9 @@ impl TokenUsageTracker {
                 next_quota,
                 next_used,
                 next_remaining,
+                if next_paused { 1_i64 } else { 0_i64 },
+                next_paused_at,
+                next_pause_reason,
                 source,
                 received_at,
                 payload,
@@ -584,6 +711,7 @@ impl TokenUsageTracker {
             llm_token_quota = ?next_quota,
             llm_token_used = next_used,
             remaining_tokens = ?next_remaining,
+            openclaw_tokens_paused = next_paused,
             "token quota state updated"
         );
 
@@ -601,7 +729,14 @@ impl TokenUsageTracker {
         instance: &str,
     ) -> UsageResult<Option<QuotaSnapshot>> {
         conn.query_row(
-            "select openclaw_instance, profile_id, llm_token_quota, llm_token_used, remaining_tokens
+            "select openclaw_instance,
+                    profile_id,
+                    llm_token_quota,
+                    llm_token_used,
+                    remaining_tokens,
+                    openclaw_tokens_paused,
+                    openclaw_tokens_paused_at,
+                    openclaw_tokens_pause_reason
              from token_quota_state
              where openclaw_instance = ?1",
             params![instance],
@@ -612,6 +747,9 @@ impl TokenUsageTracker {
                     llm_token_quota: row.get(2)?,
                     llm_token_used: row.get(3)?,
                     remaining_tokens: row.get(4)?,
+                    openclaw_tokens_paused: row.get::<_, i64>(5)? != 0,
+                    openclaw_tokens_paused_at: row.get(6)?,
+                    openclaw_tokens_pause_reason: row.get(7)?,
                 })
             },
         )
@@ -694,6 +832,46 @@ fn initialize_schema(conn: &Connection) -> UsageResult<()> {
         );
         ",
     )?;
+    ensure_column(
+        conn,
+        "token_quota_state",
+        "openclaw_tokens_paused",
+        "integer not null default 0",
+    )?;
+    ensure_column(
+        conn,
+        "token_quota_state",
+        "openclaw_tokens_paused_at",
+        "text",
+    )?;
+    ensure_column(
+        conn,
+        "token_quota_state",
+        "openclaw_tokens_pause_reason",
+        "text",
+    )?;
+    Ok(())
+}
+
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> UsageResult<()> {
+    let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+    for row in rows {
+        if row? == column {
+            return Ok(());
+        }
+    }
+
+    conn.execute(
+        &format!("alter table {table} add column {column} {definition}"),
+        [],
+    )?;
     Ok(())
 }
 
@@ -713,6 +891,27 @@ fn nested_string_field(value: &Value, parent: &str, names: &[&str]) -> Option<St
     value
         .get(parent)
         .and_then(|nested| string_field(nested, names))
+}
+
+fn bool_field(value: &Value, names: &[&str]) -> Option<bool> {
+    names.iter().find_map(|name| {
+        value.get(*name).and_then(|field| match field {
+            Value::Bool(value) => Some(*value),
+            Value::Number(number) => number.as_i64().map(|value| value != 0),
+            Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        })
+    })
+}
+
+fn nested_bool_field(value: &Value, parent: &str, names: &[&str]) -> Option<bool> {
+    value
+        .get(parent)
+        .and_then(|nested| bool_field(nested, names))
 }
 
 fn int_field(value: &Value, names: &[&str]) -> Option<i64> {
@@ -805,7 +1004,71 @@ mod tests {
             .unwrap();
 
         let exceeded = tracker.quota_exceeded().unwrap().unwrap();
+        assert_eq!(exceeded.reason, QuotaBlockReason::Exhausted);
         assert_eq!(exceeded.snapshot.remaining_tokens, Some(0));
+    }
+
+    #[test]
+    fn quota_exceeded_when_tokens_are_paused() {
+        let tracker = TokenUsageTracker::open(test_config(temp_db_path("paused"))).unwrap();
+        tracker
+            .apply_quota_payload(
+                r#"{
+                    "openclaw_instance":"test-openclaw",
+                    "llm_token_quota":100,
+                    "llm_token_used":10,
+                    "openclawTokensPaused":true,
+                    "openclawTokensPausedAt":"2026-06-21T10:00:00Z",
+                    "openclawTokensPauseReason":"user_pause"
+                }"#,
+            )
+            .unwrap();
+
+        let exceeded = tracker.quota_exceeded().unwrap().unwrap();
+        assert_eq!(exceeded.reason, QuotaBlockReason::Paused);
+        assert_eq!(exceeded.snapshot.remaining_tokens, Some(90));
+        assert!(exceeded.snapshot.openclaw_tokens_paused);
+        assert_eq!(
+            exceeded.snapshot.openclaw_tokens_paused_at.as_deref(),
+            Some("2026-06-21T10:00:00Z")
+        );
+        assert_eq!(
+            exceeded.snapshot.openclaw_tokens_pause_reason.as_deref(),
+            Some("user_pause")
+        );
+    }
+
+    #[test]
+    fn unpause_preserves_existing_quota_state() {
+        let tracker =
+            TokenUsageTracker::open(test_config(temp_db_path("resume-preserves-quota"))).unwrap();
+        tracker
+            .apply_quota_payload(
+                r#"{
+                    "openclaw_instance":"test-openclaw",
+                    "llm_token_quota":100,
+                    "llm_token_used":30,
+                    "openclawTokensPaused":true
+                }"#,
+            )
+            .unwrap();
+        tracker
+            .apply_quota_payload(
+                r#"{
+                    "openclaw_instance":"test-openclaw",
+                    "openclawTokensPaused":false
+                }"#,
+            )
+            .unwrap();
+
+        let snapshot = tracker.quota_snapshot().unwrap().unwrap();
+        assert_eq!(snapshot.llm_token_quota, Some(100));
+        assert_eq!(snapshot.llm_token_used, 30);
+        assert_eq!(snapshot.remaining_tokens, Some(70));
+        assert!(!snapshot.openclaw_tokens_paused);
+        assert!(snapshot.openclaw_tokens_paused_at.is_none());
+        assert!(snapshot.openclaw_tokens_pause_reason.is_none());
+        assert!(tracker.quota_exceeded().unwrap().is_none());
     }
 
     #[test]
